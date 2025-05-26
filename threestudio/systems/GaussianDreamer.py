@@ -10,11 +10,20 @@ from gaussiansplatting.arguments import ModelParams, PipelineParams, get_combine
 from gaussiansplatting.scene.cameras import Camera, MiniCam
 from argparse import ArgumentParser, Namespace
 import os
+import random
 from pathlib import Path
 from plyfile import PlyData, PlyElement
 from gaussiansplatting.utils.sh_utils import SH2RGB
 from gaussiansplatting.scene.gaussian_model import BasicPointCloud
 import numpy as np
+import torchvision
+import time
+import cv2
+from torchvision.utils import make_grid, save_image
+from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
+# from transformers import SamProcessor, SamModel
+# import torch.nn.functional as F
+
 # from shap_e.diffusion.sample import sample_latents
 # from shap_e.diffusion.gaussian_diffusion import diffusion_from_config as diffusion_from_config_shape
 # from shap_e.models.download import load_model, load_config
@@ -98,6 +107,8 @@ class GaussianDreamer(BaseLift3DSystem):
         prune_only_end_step: int = 3300
         prune_only_interval: int = 300
         prune_size_threshold: float = 0.008
+        masking: bool = False
+        masking_each_own: bool = False
 
         apose: bool = True
         bg_white: bool = False
@@ -112,7 +123,23 @@ class GaussianDreamer(BaseLift3DSystem):
         self.pipe = PipelineParams(self.parser)
 
         self.texture_structure_joint = self.cfg.texture_structure_joint
+        self.masking = self.cfg.masking
+        self.masking_each_own = self.cfg.masking_each_own
         self.controlnet = self.cfg.controlnet
+
+        # old method with /thirdparty/
+        self.sam = sam_model_registry['vit_h'](checkpoint='/n/holylfs05/LABS/pfister_lab/Lab/coxfs01/pfister_lab2/Lab/abenahmedk/sam/sam_vit_h_4b8939.pth')
+        self.sam.to("cuda")
+        self.mask_generator = SamAutomaticMaskGenerator(self.sam)
+        #self.mask_generator = SamPredictor(self.sam)
+
+        # self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        # self.processor = SamProcessor.from_pretrained("facebook/sam-vit-base")
+        # self.sam_model = SamModel.from_pretrained("facebook/sam-vit-base").to(self._device)        
+
+        self.scheduled_masks = []
+        self.last_mask_update_step = 0
+        self.mask_update_interval = 10
 
         if self.texture_structure_joint:
             # skel
@@ -128,7 +155,151 @@ class GaussianDreamer(BaseLift3DSystem):
             self.skel.scale(-10)
         
         self.cameras_extent = 4.0
+        
+        self.mobilenet = torchvision.models.mobilenet_v2(pretrained=True).eval()
+        self.feature_extractor = self.mobilenet.features
+
+    def generate_all_sam_masks_og(self, image_tensor: torch.Tensor):
+        """
+        image_tensor: [B, H, W, 3] floats in [0,1]
+        Produces self.scheduled_masks as a list of 2D masks (H×W), filtered by size.
+        """
+        start_time = time.time()
+        B, H, W, C = image_tensor.shape
+        all_masks = []
+        min_area = H * W * 0.005  # drop masks smaller than 5% of image area
+        max_area = H * W * 0.1 
+        print(f"{H = }, {W = }")
+        print("SAM model on:", next(self.sam.parameters()).device)
+
+        print("Predictor on:", self.mask_generator.predictor.model.device)
+
+
+        for i in range(B):
+            # to H×W×3 uint8
+            start = time.time()
+            img = (image_tensor[i].detach().cpu().numpy() * 255).astype(np.uint8)
+            print(f"moving to cpu takes {time.time() - start}")
+            start = time.time()
+            # print("########################")
+            # print("GPU memory (before):", torch.cuda.memory_allocated())
+            print("SAM model on:", next(self.sam.parameters()).device)
+
+            masks_info = self.mask_generator.generate(img)
+            # print("GPU memory (after):", torch.cuda.memory_allocated())
+            # print("########################")
+            print(f"generating this image took {time.time() - start}")
+
+            start = time.time()
+            for m in masks_info:
+                seg = m["segmentation"]  # H×W bool/uint8
+                if seg.sum() < min_area or seg.sum() > max_area:
+                    continue
+                # store as float32 mask H×W on device
+                mask_tensor = torch.from_numpy(seg.astype(np.float32)).to(image_tensor.device)
+                print(f"{mask_tensor.shape = }")
+                if self.masking_each_own:
+                    all_masks.append((mask_tensor, i))
+                else:
+                    all_masks.append(mask_tensor)
+            print(f"The masks checking took {time.time() - start}")
+
+        print(f"SAM took {time.time() - start_time} seconds")
+        # print(f"{all_masks[0].shape = }")
+        
+        self.scheduled_masks = all_masks    
     
+    def generate_all_sam_masks_old(self, image_tensor: torch.Tensor):
+        """
+        image_tensor: [B, H, W, 3] floats in [0,1]
+        Produces self.scheduled_masks as a list of 2D masks (H×W), filtered by size.
+        """
+        start = time.time()
+        device = next(self.sam_model.parameters()).device
+        B, H, W, C = image_tensor.shape
+
+        # move channels first and scale to [0,255]
+        imgs = (image_tensor.permute(0,3,1,2)).to(device)
+        print(f"{imgs.shape = }")
+
+        # tokenize only the images (no prompts)
+        inputs = self.processor(images=imgs[0], return_tensors="pt").to(device)
+        print(f"{inputs = }")
+        with torch.no_grad():
+            outputs = self.sam_model(**inputs)
+
+        # outputs.pred_masks: [B, num_masks, h', w']
+        # up‐sample back to original H×W
+        masks_lowres = outputs.pred_masks    # floats [0,1]
+        print(f"{masks_lowres.shape = }")
+        print(f"{H = }, {W = }")
+        print(f"{masks_lowres[0][0] = }")
+        #import pdb; pdb.set_trace()
+        masks_resized = F.interpolate(
+            masks_lowres,
+            size=(H, W),
+            mode="bilinear",
+            align_corners=False
+        )
+
+        # binarize (you can tweak thresh)
+        binary_masks = (masks_resized > 0.5).float()  # [B, N, H, W]
+
+        # now filter by area on‐device
+        min_area = H * W * 0.005
+        max_area = H * W * 0.1
+        all_masks = []
+        for b in range(B):
+            for n in range(binary_masks.shape[1]):
+                seg = binary_masks[b, n]            # [H,W]
+                area = seg.sum()
+                if area < min_area or area > max_area:
+                    continue
+                all_masks.append(seg)               # still on GPU
+
+        print(f"SAM (HF) took {time.time() - start :.3f}s")
+        self.scheduled_masks = all_masks
+
+    def generate_all_sam_masks(self, image_tensor: torch.Tensor):
+        B, H, W, C = image_tensor.shape
+        max_side = 256
+        min_frac, max_frac = 0.1, 0.35
+
+        all_masks = []
+        for i in range(B):
+            img_orig = (image_tensor[i].detach().cpu().numpy() * 255).astype(np.uint8)
+            scale = min(max_side / max(H, W), 1.0)
+            h_lr, w_lr = int(H*scale), int(W*scale)
+            img_lr = cv2.resize(img_orig, (w_lr, h_lr), interpolation=cv2.INTER_LINEAR)
+            print(f"{scale = }")
+            print(f"{H = }, {W = }")
+            print(f"{h_lr = }, {w_lr = }")
+
+            start = time.time()
+            masks_info = self.mask_generator.generate(img_lr)
+            print(f"generation took {time.time() - start}")
+            print(f"{len(masks_info) = }")
+
+            start = time.time()
+            for m in masks_info:
+                seg_lr = m["segmentation"]
+                frac = seg_lr.sum() / (h_lr * w_lr)
+                if not (min_frac <= frac < max_frac):
+                    continue
+                    
+                seg_up = cv2.resize(
+                    seg_lr.astype(np.uint8),
+                    (W, H), 
+                    interpolation=cv2.INTER_NEAREST
+                ).astype(bool)
+
+                mask_tensor = torch.from_numpy(seg_up.astype(np.float32)).to(image_tensor.device)
+                print(f"post processing {time.time() - start}")
+                all_masks.append((mask_tensor, i) if self.masking_each_own else mask_tensor)
+
+        self.scheduled_masks = all_masks
+
+
     def save_gif_to_file(self,images, output_file):  
         with io.BytesIO() as writer:  
             images[0].save(  
@@ -314,7 +485,7 @@ class GaussianDreamer(BaseLift3DSystem):
         self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance)
     
     def training_step(self, batch, batch_idx):
-
+        
         self.gaussian.update_learning_rate(self.true_global_step)
         
         if self.true_global_step > self.cfg.half_scheduler_max_step:
@@ -364,16 +535,142 @@ class GaussianDreamer(BaseLift3DSystem):
         loss_opaque = binary_cross_entropy(opacity_clamped, opacity_clamped)
         self.log("train/loss_opaque", loss_opaque)
         loss += loss_opaque * self.C(self.cfg.loss.lambda_opaque)
-        if guidance_eval:
-            self.guidance_evaluation_save(
-                out["comp_rgb"].detach()[: guidance_out["eval"]["bs"]],
-                guidance_out["eval"],
-            )
+
+        if not self.masking:
+            print("We are not masking")
+            if guidance_eval:
+                self.guidance_evaluation_save(
+                    out["comp_rgb"].detach()[: guidance_out["eval"]["bs"]],
+                    guidance_out["eval"],
+                )
+
+        elif self.masking_each_own and self.global_step % 51 == 0:
+            print("We ARE masking")
+            start = time.time()
+            self.generate_all_sam_masks(images)
+            print(f"generation took {time.time() - start}")
+            
+            fvecs = []
+            start = time.time()
+            for seg, img_idx in self.scheduled_masks:
+                # build the single masked crop
+                m = seg.unsqueeze(-1)                              # [H,W,1]
+                crop = (images[img_idx] * m).unsqueeze(0)           # [1,H,W,3]
+                crop_chw = crop.permute(0,3,1,2)                    # [1,3,H,W]
+                # resize + extract features
+                x224 = F.interpolate(crop_chw, (224,224), mode="bilinear", align_corners=False)
+                with torch.no_grad():
+                    fmap = self.feature_extractor(x224)             # [1,C,h,w]
+                fvec = fmap.mean(dim=[2,3]).squeeze(0)              # [C]
+                fvecs.append(fvec)
+            Ff = torch.stack(fvecs, dim=0)
+            F_norm = Ff / Ff.norm(dim=1, keepdim=True)
+            print(f"features {time.time() - start}")
+
+            available = list(range(len(self.scheduled_masks)))  
+            used = set()
+            total_calls = 4  
+
+            start = time.time()
+
+            for _call_i in range(total_calls):  
+                # pick from the ones never used yet  
+                avail = [i for i in available if i not in used]  
+                if len(avail) < 1:  
+                    break  
+
+                # 1) random anchor  
+                anchor_idx = random.choice(avail)  
+                used.add(anchor_idx)  
+
+                # 2) find its 3 most similar among the remaining pool  
+                sims = (F_norm[anchor_idx:anchor_idx+1] @ F_norm.T).squeeze(0)  
+                # make sure sims for already-used are -inf so topk skips them  
+                min_val = torch.finfo(sims.dtype).min
+                for u in used:  
+                    sims[u] = min_val  
+                k = min(3, len(avail) - 1)  
+                if k > 0:  
+                    topk = sims.topk(k=k).indices.tolist()  
+                    for t in topk:  
+                        used.add(t)  
+                    selected = [anchor_idx] + topk  
+                else:  
+                    selected = [anchor_idx]  
+
+                # 3) build your mini-batch of masked RGB/depth/ctrl  
+                rgb_list, d_list, ctrl_list = [], [], []  
+                batch_info = {k: [] for k,v in batch.items() if torch.is_tensor(v) and v.shape[0] == images.shape[0]}  
+                for idx in selected:  
+                    seg, img_idx = self.scheduled_masks[idx]  
+                    m = seg.unsqueeze(-1)  
+                    rgb_list.append((images[img_idx]*m).unsqueeze(0))  
+                    d_list.append((depth_images[img_idx]*m).unsqueeze(0))  
+                    ctrl_list.append(control_images[img_idx:img_idx+1])  
+                    for k in batch_info:  
+                        batch_info[k].append(batch[k][img_idx:img_idx+1])  
+
+                mi_cat  = torch.cat(rgb_list, dim=0)  
+                md_cat  = torch.cat(d_list, dim=0)  
+                ctrl_cat= torch.cat(ctrl_list, dim=0)
+
+                # mi_vis = mi_cat.permute(0, 3, 1, 2).detach().cpu()
+
+                # # make a grid of all N masked crops on one row
+                # grid = make_grid(mi_vis, nrow=mi_vis.size(0), normalize=True, value_range=(0,1))
+
+                # # choose an output directory (or reuse your existing `out_dir`)
+                # out_dir = "/n/holylfs05/LABS/pfister_lab/Lab/coxfs01/pfister_lab2/Lab/abenahmedk/interm_vis"
+                # os.makedirs(out_dir, exist_ok=True)
+
+                # # save it
+                # save_image(
+                #     grid,
+                #     os.path.join(out_dir, f"selected_masks_step{self.global_step}.png")
+                # )
+                # print(f"🔍 Saved selected masked crops to {out_dir}/selected_masks_step{self.global_step}.png")  
+                for k in batch_info:  
+                    batch_info[k] = torch.cat(batch_info[k], dim=0)  
+                # print(f"{ctrl_cat = }")
+                # # 4) single SDS call  
+                # guidance_out = self.guidance(  
+                #     mi_cat, md_cat, prompt_utils=prompt_utils,  
+                #     control_images=ctrl_cat,  
+                #     **batch_info, rgb_as_latents=False  
+                # )  
+                if self.texture_structure_joint:
+                    # (control, rgb, depth, prompt)
+                    guidance_out = self.guidance(
+                        ctrl_cat,         # control_images
+                        mi_cat,           # rgb
+                        md_cat,           # depth
+                        prompt_utils,     # prompt
+                        **batch_info,
+                        rgb_as_latents=False,
+                    )
+                elif self.controlnet:
+                    # (control, rgb, prompt)
+                    guidance_out = self.guidance(
+                        ctrl_cat,         # control_images
+                        mi_cat,           # rgb
+                        prompt_utils,     # prompt
+                        **batch_info,
+                        rgb_as_latents=False,
+                    )
+                else:
+                    # (rgb, prompt)
+                    guidance_out = self.guidance(
+                        mi_cat,           # rgb
+                        prompt_utils,     # prompt
+                        **batch_info,
+                        rgb_as_latents=False,
+                    )
+                loss += guidance_out['loss_sds'].mean() * self.C(self.cfg.loss['lambda_sds'])  
+
+            print(f"rest took {time.time() - start}")
         for name, value in self.cfg.loss.items():
             self.log(f"train_params/{name}", self.C(value))
         return {"loss": loss}
-
-
 
     def on_before_optimizer_step(self, optimizer):
 

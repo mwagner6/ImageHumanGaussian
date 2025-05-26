@@ -105,6 +105,7 @@ class StableDiffusionGuidance(BaseObject):
             vae=vae,
             torch_dtype=self.weights_dtype,
         ).to(torch_dtype=self.weights_dtype, torch_device=self.device)
+        self.pipe.to(self.device)
 
         if self.cfg.enable_memory_efficient_attention:
             if parse_version(torch.__version__) >= parse_version("2"):
