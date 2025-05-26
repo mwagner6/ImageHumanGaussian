@@ -30,6 +30,12 @@ pip install -r requirements.txt
 # a modified gaussian splatting (+ depth, alpha rendering)
 git clone --recursive https://github.com/ashawkey/diff-gaussian-rasterization
 pip install ./diff-gaussian-rasterization
+
+# To add SAM
+mkdir third_party
+cd third_party
+git clone https://github.com/facebookresearch/segment-anything.git
+cd ..
 ```
 
 ## Text Prompts Gallery
