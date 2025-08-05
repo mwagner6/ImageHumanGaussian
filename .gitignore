@@ -190,3 +190,6 @@ wandb/
 
 #nlf
 nlf/
+
+#run file
+run_diffusion.sh
