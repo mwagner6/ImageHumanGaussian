@@ -15,7 +15,7 @@ from diff_gaussian_rasterization import GaussianRasterizationSettings, GaussianR
 from gaussiansplatting.scene.gaussian_model import GaussianModel
 from gaussiansplatting.utils.sh_utils import eval_sh
 
-def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None):
+def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, scaling_modifier = 1.0, override_color = None, subset_ids = None):
     """
     Render the scene. 
     
@@ -23,6 +23,15 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
     """
  
     # Create zero tensor. We will use it to make pytorch return gradients of the 2D (screen-space) means
+    #screenspace_points = torch.zeros((1000, 3), device="cuda", requires_grad=True)
+
+    N = pc.get_xyz.shape[0]
+
+    if subset_ids is None:
+        subset_ids = torch.arange(N, device="cuda").long()
+    else:
+        subset_ids = subset_ids.long()
+
     screenspace_points = torch.zeros_like(pc.get_xyz, dtype=pc.get_xyz.dtype, requires_grad=True, device="cuda") + 0
     try:
         screenspace_points.retain_grad()
@@ -83,22 +92,32 @@ def render(viewpoint_camera, pc : GaussianModel, pipe, bg_color : torch.Tensor, 
 
     # Rasterize visible Gaussians to image, obtain their radii (on screen). 
     # import pdb; pdb.set_trace()
+
     rendered_image, radii, depth, alpha= rasterizer(
-        means3D = means3D.float(),
-        means2D = means2D.float(),
-        shs = shs.float(),
+        means3D = means3D.float()[subset_ids],
+        means2D = means2D.float()[subset_ids],
+        shs = None if shs is None else shs.float()[subset_ids],
         colors_precomp = colors_precomp,
-        opacities = opacity.float(),
-        scales = scales.float(),
-        rotations = rotations.float(),
+        opacities = opacity.float()[subset_ids],
+        scales = scales.float()[subset_ids],
+        rotations = rotations.float()[subset_ids],
         cov3D_precomp = cov3D_precomp)
 
     # Those Gaussians that were frustum culled or had a radius of 0 were not visible.
     # They will be excluded from value updates used in the splitting criteria.
-    return {"render": rendered_image,
-            "viewspace_points": screenspace_points,
-            "visibility_filter" : radii > 0,
-            "radii": radii,
-            "depth_3dgs":depth,
-            "alpha_3dgs":alpha,
-            }
+    
+    full_radii = torch.zeros(N, device="cuda")
+    full_visibility = torch.zeros(N, dtype=torch.bool, device="cuda")
+    full_radii = full_radii.to(radii.dtype)
+    full_radii[subset_ids] = radii
+    full_visibility[subset_ids] = radii > 0
+
+    return {
+        "render": rendered_image,
+        "viewspace_points": screenspace_points,
+        "radii": full_radii,
+        "visibility_filter": full_visibility,
+        "depth_3dgs": depth,
+        "alpha_3dgs": alpha,
+        "subset_ids": subset_ids
+    }
