@@ -20,6 +20,7 @@ from gaussiansplatting.utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
 from gaussiansplatting.utils.graphics_utils import BasicPointCloud
 from gaussiansplatting.utils.general_utils import strip_symmetric, build_scaling_rotation
+import torch.nn.functional as F
 
 class GaussianModel:
 
@@ -128,6 +129,7 @@ class GaussianModel:
         features = torch.zeros((fused_color.shape[0], 3, (self.max_sh_degree + 1) ** 2)).float().cuda()
         features[:, :3, 0 ] = fused_color
         features[:, 3:, 1:] = 0.0
+        print("Initialization features fused color: ", features[:, :3, 0])
 
         print("Number of points at initialisation : ", fused_point_cloud.shape[0])
 
@@ -436,3 +438,61 @@ class GaussianModel:
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor[update_filter,:2], dim=-1, keepdim=True)
         
         self.denom[update_filter] += 1
+    
+    @torch.no_grad()
+    def bake_colors_from_image_and_camera(
+        self,
+        image: torch.Tensor,
+        intrinsics: torch.Tensor,
+        extrinsics: torch.Tensor,
+        image_size: tuple
+    ):
+        H, W = image_size
+        device = self.get_xyz.device
+        image = image.to(device)
+
+        # Gaussians in world space (N, 3)
+        xyz = self.get_xyz  # (N, 3)
+        N = xyz.shape[0]
+
+        # Transform Gaussians to camera space
+        xyz_h = torch.cat([xyz, torch.ones((N, 1), device=device)], dim=-1)  # (N, 4)
+        world2cam = extrinsics  # (4, 4)
+        cam_xyz = (world2cam @ xyz_h.T).T[:, :3]  # (N, 3)
+
+        # Filter points behind camera (z <= 0)
+        in_front = cam_xyz[:, 2] > 0
+        cam_xyz = cam_xyz[in_front]
+        indices = in_front.nonzero(as_tuple=True)[0]
+
+        # Project to image plane using intrinsics
+        intrinsic = intrinsics[0]
+        fx, fy = intrinsic[0, 0], intrinsic[1, 1]
+        cx, cy = intrinsic[0, 2], intrinsic[1, 2]
+
+        x = (cam_xyz[:, 0] / cam_xyz[:, 2]) * fx + cx
+        y = (cam_xyz[:, 1] / cam_xyz[:, 2]) * fy + cy
+
+        # Normalize to [-1, 1] for grid_sample
+        norm_x = (x / (W - 1)) * 2 - 1
+        norm_y = (y / (H - 1)) * 2 - 1
+        grid = torch.stack([norm_x, norm_y], dim=1).unsqueeze(0).unsqueeze(2)  # (1, N, 1, 2)
+
+        # Prepare image for sampling
+        image = image.unsqueeze(0)  # (1, 3, H, W)
+
+        # Sample colors from the image
+        image = image.float() / 255.0
+        sampled = F.grid_sample(image, grid, align_corners=True, mode='bilinear')  # (1, 3, N, 1)
+        sampled = sampled.squeeze().T  # (N_visible, 3)
+
+        from gaussiansplatting.utils.sh_utils import RGB2SH  # Make sure this import is correct
+        sh_dc = RGB2SH(sampled)  # (N_visible, 3)
+
+        # Set features_dc (SH degree 0)
+        self._features_dc = torch.zeros_like(self._features_dc)
+        self._features_dc[indices] = sh_dc[:, None, :]  # (N_visible, 1, 3)
+
+        # Set features_rest (SH degrees > 0), zeroed
+        num_coeffs = (self.max_sh_degree + 1) ** 2
+        self._features_rest = torch.zeros((N, num_coeffs - 1, 3), device=device)  # (N, C-1, 3)
