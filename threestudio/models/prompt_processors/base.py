@@ -16,6 +16,7 @@ from threestudio.utils.ops import shifted_cosine_decay, shifted_expotional_decay
 from threestudio.utils.typing import *
 
 
+
 def hash_prompt(model: str, prompt: str) -> str:
     import hashlib
 
@@ -179,7 +180,7 @@ class PromptProcessor(BaseObject):
     @dataclass
     class Config(BaseObject.Config):
         prompt: str = "a hamburger"
-
+        
         # manually assigned view-dependent prompts
         prompt_front: Optional[str] = None
         prompt_side: Optional[str] = None
@@ -216,6 +217,8 @@ class PromptProcessor(BaseObject):
 
     cfg: Config
 
+    tokenized_options: Optional[Dict[str, Tensor]] = None
+
     @rank_zero_only
     def configure_text_encoder(self) -> None:
         raise NotImplementedError
@@ -242,18 +245,18 @@ class PromptProcessor(BaseObject):
                     lambda s: f"front view of {s}",
                     lambda s: s,
                     lambda ele, azi, dis: (
-                        shift_azimuth_deg(azi) > -self.cfg.front_threshold
+                        shift_azimuth_deg(azi) > -self.cfg.front_threshold - 90
                     )
-                    & (shift_azimuth_deg(azi) < self.cfg.front_threshold),
+                    & (shift_azimuth_deg(azi) < self.cfg.front_threshold) - 90,
                 ),
                 DirectionConfig(
                     "back",
                     lambda s: f"backside view of {s}",
                     lambda s: s,
                     lambda ele, azi, dis: (
-                        shift_azimuth_deg(azi) > 180 - self.cfg.back_threshold
+                        shift_azimuth_deg(azi) > 90 - self.cfg.back_threshold
                     )
-                    | (shift_azimuth_deg(azi) < -180 + self.cfg.back_threshold),
+                    & (shift_azimuth_deg(azi) < 90 + self.cfg.back_threshold),
                 ),
                 DirectionConfig(
                     "overhead",
@@ -275,18 +278,18 @@ class PromptProcessor(BaseObject):
                     lambda s: f"{s}, front view",
                     lambda s: s,
                     lambda ele, azi, dis: (
-                        shift_azimuth_deg(azi) > -self.cfg.front_threshold
+                        shift_azimuth_deg(azi) > -self.cfg.front_threshold - 90
                     )
-                    & (shift_azimuth_deg(azi) < self.cfg.front_threshold),
+                    & (shift_azimuth_deg(azi) < self.cfg.front_threshold - 90),
                 ),
                 DirectionConfig(
                     "back",
                     lambda s: f"{s}, back view",
                     lambda s: s,
                     lambda ele, azi, dis: (
-                        shift_azimuth_deg(azi) > 180 - self.cfg.back_threshold
+                        shift_azimuth_deg(azi) > 90 - self.cfg.back_threshold
                     )
-                    | (shift_azimuth_deg(azi) < -180 + self.cfg.back_threshold),
+                    & (shift_azimuth_deg(azi) < 90 + self.cfg.back_threshold),
                 ),
                 DirectionConfig(
                     "overhead",
@@ -340,6 +343,91 @@ class PromptProcessor(BaseObject):
 
         self.prepare_text_embeddings()
         self.load_text_embeddings()
+
+    def prepare_prompt_options_embeddings(self, prompt_options: Dict[str, str]) -> None:
+        """
+        For each key in prompt_options, computes and caches:
+        - text_embeddings (main prompt)
+        - text_embeddings_vd (view-dependent prompts)
+        Stores them in:
+            self.text_embeddings_dict[key]
+            self.text_embeddings_vd_dict[key]
+        """
+        os.makedirs(self._cache_dir, exist_ok=True)
+
+        self.text_embeddings_dict = {}
+        self.text_embeddings_vd_dict = {}
+
+        prompts_to_process = set()
+        processed_prompts = {}  # key -> prompt
+        prompts_vd_by_key = {}  # key -> [side, front, back, overhead]
+
+        for key, raw_prompt in prompt_options.items():
+            prompt = self.preprocess_prompt(raw_prompt)
+            processed_prompts[key] = prompt
+
+            # Generate view-dependent prompts using same logic from `configure()`
+            if self.cfg.use_prompt_debiasing:
+                assert (
+                    self.cfg.prompt_side is None
+                    and self.cfg.prompt_back is None
+                    and self.cfg.prompt_overhead is None
+                ), "Do not assign prompt_side/back/overhead when using debiasing"
+
+                prompts_vd = [
+                    d.prompt(dp) for d, dp in zip(self.directions, self.get_debiased_prompt(prompt))
+                ]
+            else:
+                prompts_vd = [
+                    self.cfg.get(f"prompt_{d.name}", None) or d.prompt(prompt)  # type: ignore
+                    for d in self.directions
+                ]
+
+            prompts_vd_by_key[key] = prompts_vd
+
+            # Schedule for embedding if not already cached
+            all_prompts = [prompt] + prompts_vd
+            for p in all_prompts:
+                cache_path = os.path.join(
+                    self._cache_dir,
+                    f"{hash_prompt(self.cfg.pretrained_model_name_or_path, p)}.pt",
+                )
+                if not os.path.exists(cache_path):
+                    prompts_to_process.add(p)
+
+        # Run spawn_func if needed
+        if prompts_to_process:
+            prompts_to_process = list(prompts_to_process)
+            if self.cfg.spawn:
+                import torch.multiprocessing as mp
+                ctx = mp.get_context("spawn")
+                subprocess = ctx.Process(
+                    target=self.spawn_func,
+                    args=(
+                        self.cfg.pretrained_model_name_or_path,
+                        prompts_to_process,
+                        self._cache_dir,
+                    ),
+                )
+                subprocess.start()
+                subprocess.join()
+            else:
+                self.spawn_func(
+                    self.cfg.pretrained_model_name_or_path,
+                    prompts_to_process,
+                    self._cache_dir,
+                )
+            cleanup()
+
+        # Load all embeddings
+        for key, prompt in processed_prompts.items():
+            self.text_embeddings_dict[key] = self.load_from_cache(prompt)[None, ...]
+
+            prompts_vd = prompts_vd_by_key[key]
+            vd_embeds = [self.load_from_cache(p) for p in prompts_vd]
+            self.text_embeddings_vd_dict[key] = torch.stack(vd_embeds, dim=0)
+
+        threestudio.info(f"Prepared prompt + view-dependent embeddings for {len(prompt_options)} keys.")
 
     @staticmethod
     def spawn_func(pretrained_model_name_or_path, prompts, cache_dir):
@@ -506,18 +594,40 @@ class PromptProcessor(BaseObject):
 
         return debiased_prompts
 
-    def __call__(self) -> PromptProcessorOutput:
-        return PromptProcessorOutput(
-            text_embeddings=self.text_embeddings,
-            uncond_text_embeddings=self.uncond_text_embeddings,
-            null_embeddings=self.null_embeddings,
-            text_embeddings_vd=self.text_embeddings_vd,
-            uncond_text_embeddings_vd=self.uncond_text_embeddings_vd,
-            directions=self.directions,
-            direction2idx=self.direction2idx,
-            use_perp_neg=self.cfg.use_perp_neg,
-            perp_neg_f_sb=self.cfg.perp_neg_f_sb,
-            perp_neg_f_fsb=self.cfg.perp_neg_f_fsb,
-            perp_neg_f_fs=self.cfg.perp_neg_f_fs,
-            perp_neg_f_sf=self.cfg.perp_neg_f_sf,
-        )
+    def __call__(self, key: Optional[str] = None) -> PromptProcessorOutput:
+        if key is None:
+            return PromptProcessorOutput(
+                text_embeddings=self.text_embeddings,
+                uncond_text_embeddings=self.uncond_text_embeddings,
+                null_embeddings=self.null_embeddings,
+                text_embeddings_vd=self.text_embeddings_vd,
+                uncond_text_embeddings_vd=self.uncond_text_embeddings_vd,
+                directions=self.directions,
+                direction2idx=self.direction2idx,
+                use_perp_neg=self.cfg.use_perp_neg,
+                perp_neg_f_sb=self.cfg.perp_neg_f_sb,
+                perp_neg_f_fsb=self.cfg.perp_neg_f_fsb,
+                perp_neg_f_fs=self.cfg.perp_neg_f_fs,
+                perp_neg_f_sf=self.cfg.perp_neg_f_sf,
+            )
+        else:
+            if not hasattr(self, "text_embeddings_dict"):
+                raise ValueError("text_embeddings_dict not found")
+
+            if key not in self.text_embeddings_dict:
+                raise KeyError(f"key '{key}' not  in text_embeddings_dict.")
+            
+            return PromptProcessorOutput(
+                    text_embeddings=self.text_embeddings_dict[key],
+                    uncond_text_embeddings=self.uncond_text_embeddings,
+                    null_embeddings=self.null_embeddings,
+                    text_embeddings_vd=self.text_embeddings_vd_dict[key],
+                    uncond_text_embeddings_vd=self.uncond_text_embeddings_vd,
+                    directions=self.directions,
+                    direction2idx=self.direction2idx,
+                    use_perp_neg=self.cfg.use_perp_neg,
+                    perp_neg_f_sb=self.cfg.perp_neg_f_sb,
+                    perp_neg_f_fsb=self.cfg.perp_neg_f_fsb,
+                    perp_neg_f_fs=self.cfg.perp_neg_f_fs,
+                    perp_neg_f_sf=self.cfg.perp_neg_f_sf,
+                )
