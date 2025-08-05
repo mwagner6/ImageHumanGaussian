@@ -286,37 +286,41 @@ class Skeleton:
         
         # coordinate system: opengl --> blender (switch y/z)
         self.points3D[:, [1, 2]] = self.points3D[:, [2, 1]]
+
     
-    def load_smplx(self, path, betas=None, expression=None, gender='neutral'):
+    def load_smplx(self, path, betas=None, expression=None, pred=None, gender='neutral'):
 
         import smplx, torch
+
+        device = torch.device('cuda')
+
+        pose = pred['pose'][0][0:1].to(device)
+        betas = pred['betas'][0][0:1].to(device)
+        transl = pred['trans'][0][0:1].to(device)
+
 
         smplx_model = smplx.create(
             path, 
             model_type='smplx',
             gender=gender, 
             use_face_contour=False,
-            num_betas=10,
+            num_betas=betas.shape[1],
             num_expression_coeffs=10,
             ext='npz',
             flat_hand_mean=True,
-        )
-
-        body_pose = np.zeros((21, 3), dtype=np.float32)
-        if self.apose:
-            body_pose[0, 1] = 0.2
-            body_pose[0, 2] = 0.1
-            body_pose[1, 1] = -0.2
-            body_pose[1, 2] = -0.1
-            body_pose[15, 2] = -0.7853982
-            body_pose[16, 2] = 0.7853982
-            body_pose[19, 0] = 1.0
-            body_pose[20, 0] = 1.0
+            use_pca=False
+        ).to(device)
 
         smplx_output = smplx_model(
-            body_pose=torch.tensor(body_pose, dtype=torch.float32).unsqueeze(0),
-            # betas=torch.tensor(default_pose['shape'], dtype=torch.float32).unsqueeze(0),
-            betas=betas, 
+            global_orient=pose[:, :3],
+            body_pose=pose[:, 3:22*3],
+            betas=betas,
+            transl=transl,
+            left_hand_pose=pose[:, 25*3:40*3],
+            right_hand_pose=pose[:, 40*3:55*3],
+            jaw_pose=pose[:, 22*3:23*3],
+            leye_pose=pose[:, 23*3:24*3],
+            reye_pose=pose[:, 24*3:25*3],
             expression=expression, 
             return_verts=True
         )
@@ -333,7 +337,7 @@ class Skeleton:
             
         self.points3D = np.concatenate([joints, np.ones_like(joints[:, :1])], axis=1) # [18, 4]
 
-        # rescale and recenter 
+    def normalize(self):
         vmin = self.vertices.min(0)
         vmax = self.vertices.max(0)
         self.ori_center = (vmax + vmin) / 2
@@ -341,15 +345,15 @@ class Skeleton:
         self.vertices = (self.vertices - self.ori_center) * self.ori_scale
         self.points3D[:, :3] = (self.points3D[:, :3] - self.ori_center) * self.ori_scale
 
-        # coordinate system: opengl --> blender (switch y/z)
         self.points3D[:, [1, 2]] = self.points3D[:, [2, 1]]
         self.vertices[:, [1, 2]] = self.vertices[:, [2, 1]]
-
         
-    def scale(self, delta):
+    def scale(self, delta, t=None):
         self.points3D[:, :3] *= 1.1 ** (-delta)
         if self.vertices is not None:
             self.vertices *= 1.1 ** (-delta)
+        if t is not None:
+            return t * (1.1 ** (-delta))
 
     def pan(self, rot, dx, dy, dz=0):
         # pan in camera coordinate system (careful on the sensitivity!)
