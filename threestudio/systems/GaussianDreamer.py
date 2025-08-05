@@ -1,6 +1,9 @@
+import math
 from dataclasses import dataclass, field
 import torch
 import threestudio
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D
 from threestudio.systems.base import BaseLift3DSystem
 from threestudio.utils.ops import binary_cross_entropy, dot
 from threestudio.utils.typing import *
@@ -17,10 +20,12 @@ from gaussiansplatting.utils.sh_utils import SH2RGB
 from gaussiansplatting.scene.gaussian_model import BasicPointCloud
 import numpy as np
 import torchvision
+import torchvision.transforms.functional as TFunc
 import time
 import cv2
 from torchvision.utils import make_grid, save_image
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
+
 # from transformers import SamProcessor, SamModel
 # import torch.nn.functional as F
 
@@ -82,6 +87,121 @@ def fetchPly(path):
     normals = np.vstack([vertices['nx'], vertices['ny'], vertices['nz']]).T
     return BasicPointCloud(points=positions, colors=colors, normals=normals)
 
+def axis_angle_to_matrix(axis_angle):
+    angle = torch.norm(axis_angle, dim=1, keepdim=True)
+    axis = axis_angle / (angle + 1e-8)
+    x, y, z = axis[:, 0], axis[:, 1], axis[:, 2]
+
+    cos = torch.cos(angle).squeeze(1)
+    sin = torch.sin(angle).squeeze(1)
+    one_minus_cos = 1 - cos
+
+    rot = torch.zeros((axis.shape[0], 3, 3), device=axis.device)
+    rot[:, 0, 0] = cos + x * x * one_minus_cos
+    rot[:, 0, 1] = x * y * one_minus_cos - z * sin
+    rot[:, 0, 2] = x * z * one_minus_cos + y * sin
+
+    rot[:, 1, 0] = y * x * one_minus_cos + z * sin
+    rot[:, 1, 1] = cos + y * y * one_minus_cos
+    rot[:, 1, 2] = y * z * one_minus_cos - x * sin
+
+    rot[:, 2, 0] = z * x * one_minus_cos - y * sin
+    rot[:, 2, 1] = z * y * one_minus_cos + x * sin
+    rot[:, 2, 2] = cos + z * z * one_minus_cos
+
+    return rot
+
+def draw_camera_frustum(ax, c2w: torch.Tensor, intrinsics: torch.Tensor, image_size: tuple, scale=0.1, color='r'):
+    """
+    Draws a camera frustum in 3D.
+    c2w: (4, 4) camera-to-world matrix
+    intrinsics: (3, 3)
+    image_size: (H, W)
+    """
+    H, W = image_size
+    fx = intrinsics[0, 0].item()
+    fy = intrinsics[1, 1].item()
+    cx = intrinsics[0, 2].item()
+    cy = intrinsics[1, 2].item()
+
+    # Create image plane corners in pixel space
+    corners = np.array([
+        [0, 0],
+        [W, 0],
+        [W, H],
+        [0, H]
+    ])
+
+    # Project to normalized image plane (camera space, z = 1)
+    cam_corners = []
+    for (u, v) in corners:
+        x = (u - cx) / fx
+        y = (v - cy) / fy
+        cam_corners.append([x, y, 1])
+    cam_corners = np.array(cam_corners).T  # (3, 4)
+
+    # Scale and transform to world space
+    cam_corners *= scale  # make frustum visible
+    cam_corners = np.vstack((cam_corners, np.ones((1, 4))))  # (4, 4)
+    world_corners = (c2w @ torch.tensor(cam_corners).float().to(c2w.device)).cpu().numpy()[:3]
+
+    cam_origin = c2w[:3, 3].cpu().numpy()
+
+    # Draw lines from origin to corners
+    for i in range(4):
+        ax.plot(
+            [cam_origin[0], world_corners[0, i]],
+            [cam_origin[1], world_corners[1, i]],
+            [cam_origin[2], world_corners[2, i]],
+            color=color
+        )
+
+    # Draw image plane edges
+    for i in range(4):
+        j = (i + 1) % 4
+        ax.plot(
+            [world_corners[0, i], world_corners[0, j]],
+            [world_corners[1, i], world_corners[1, j]],
+            [world_corners[2, i], world_corners[2, j]],
+            color=color
+        )
+
+
+def debug_render_splats_and_camera(gaussian_model, c2w, intrinsics, image_size, save_path="debug_render.png"):
+    xyz = gaussian_model.get_xyz.detach().cpu().numpy()
+
+    fig = plt.figure(figsize=(10, 10))
+    ax = fig.add_subplot(111, projection='3d')
+    ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], s=1, alpha=0.5, label='Splats')
+
+    draw_camera_frustum(ax, c2w, intrinsics, image_size, scale=0.3, color='r')
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.set_title("Gaussian Splats and Camera Frustum")
+    ax.view_init(elev=20, azim=90)
+    ax.legend()
+    plt.tight_layout()
+    plt.savefig(save_path)
+    print(f"Saved debug render to {save_path}")
+
+def sample_colors(image, verts2d):
+    H, W = image.shape[1:]  # CxHxW
+
+    # Normalize verts2d to [-1, 1] for grid_sample
+    verts_norm = verts2d.clone()
+    verts_norm[:, 0] = (verts_norm[:, 0] / (W - 1)) * 2 - 1
+    verts_norm[:, 1] = (verts_norm[:, 1] / (H - 1)) * 2 - 1
+    verts_norm = verts_norm.unsqueeze(0).unsqueeze(2)  # [1, N, 1, 2]
+
+    # Image must be float and [1, C, H, W]
+    image = image.float().unsqueeze(0) / 255.0
+
+    # Sample colors
+    sampled = F.grid_sample(image, verts_norm, align_corners=True, mode='bilinear')  # [1, C, N, 1]
+    colors = sampled.squeeze(0).squeeze(2).permute(1, 0)  # [N, C]
+    return colors
+
 
 @threestudio.register("gaussiandreamer-system")
 class GaussianDreamer(BaseLift3DSystem):
@@ -112,6 +232,10 @@ class GaussianDreamer(BaseLift3DSystem):
 
         apose: bool = True
         bg_white: bool = False
+        use_img: bool = False
+        img_path: str = ""
+
+        prompt_options_json: Optional[dict] = None
 
     cfg: Config
     def configure(self) -> None:
@@ -141,23 +265,148 @@ class GaussianDreamer(BaseLift3DSystem):
         self.last_mask_update_step = 0
         self.mask_update_interval = 10
 
-        if self.texture_structure_joint:
-            # skel
-            self.skel = Skeleton(humansd_style=True, apose=self.cfg.apose)
-            # self.skel.load_json('17point')
-            self.skel.load_smplx(self.cfg.smplx_path, gender=self.cfg.gender)
-            self.skel.scale(-10)
+        self.use_img = self.cfg.use_img
+        self.img_path = self.cfg.img_path
+        self.precolor = None
+
+        if self.use_img:
+            model = torch.jit.load('nlf/models/nlf_l_multi.torchscript').cuda().eval()
+            self.image = TFunc.rotate(TFunc.hflip(torchvision.io.read_image(self.img_path)), angle=180).cuda()
+
+            frame_batch = self.image.unsqueeze(0)
+            with torch.inference_mode(), torch.device('cuda'):
+                pred = model.detect_smpl_batched(frame_batch, model_name='smplx')
+
+            pose = pred['pose'][0]
+            transl = pred['trans'][0]
+            betas = pred['betas'][0]
+            
+            import smplx
+            bm = smplx.SMPLX(os.path.join(self.cfg.smplx_path, "smplx"), use_pca=False).cuda().eval()
+            res = bm(global_orient=pose[:, :3],
+                        body_pose=pose[:, 3:22*3],
+                        betas=betas,
+                        transl=transl,
+                        left_hand_pose=pose[:, 25*3:40*3],
+                        right_hand_pose=pose[:, 40*3:55*3],
+                        jaw_pose=pose[:, 22*3:23*3],
+                        leye_pose=pose[:, 23*3:24*3],
+                        reye_pose=pose[:, 24*3:25*3],
+                        expression=torch.zeros_like(betas[:, :10])
+                    )
+
+           
+
+            def project_vertices(coords3d, intrinsic_matrix):
+                projected = coords3d / torch.maximum(
+                    torch.tensor(0.001), torch.tensor(coords3d[..., 2:]))
+                return torch.einsum('bnk,bjk->bnj', projected, intrinsic_matrix[..., :2, :])
+
+            self.v3d = pred['vertices3d'][0][0].detach().cpu().numpy()
+            faces = bm.faces
+
+            import trimesh
+
+            mesh = trimesh.Trimesh(self.v3d, faces, process=False)
+            sampled_points, _ = trimesh.sample.sample_surface(mesh, self.cfg.pts_num)
+
+            self.sampled_points_tensor = torch.tensor(sampled_points, dtype=torch.float32, device='cuda')
+
+            from nlf.pt import ptu3d
+            self.intrinsic = ptu3d.intrinsic_matrix_from_field_of_view(55, self.image.shape[1:3])
+
+            verts2d = project_vertices(self.sampled_points_tensor.unsqueeze(0), self.intrinsic.to(self.sampled_points_tensor.device)).squeeze(0)
+            self.precolor = sample_colors(self.image, verts2d)
+          
+
+            R_body_to_world = axis_angle_to_matrix(pose[:, :3])
+
+            t = transl[0]
+            self.extrinsic = torch.eye(4, dtype=torch.float32).cuda()
+            self.extrinsic[:3, :3] = R_body_to_world[0]
+            self.extrinsic[:3, 3] = t
+            self.extrinsic = torch.inverse(self.extrinsic)
+
+
+            if self.texture_structure_joint:
+                self.skel = Skeleton(humansd_style=True, apose=self.cfg.apose)
+                t = self.skel.load_smplx(self.cfg.smplx_path, pred=pred, gender=self.cfg.gender)
+                #t = self.skel.scale(-10)
+
+            else:
+                self.skel = Skeleton(apose=self.cfg.apose)
+                self.skel.load_smplx(self.cfg.smplx_path, pred=pred, gender=self.cfg.gender)
+                #t = self.skel.scale(-10) 
+
+            
+
         else:
-            # skel
-            self.skel = Skeleton(apose=self.cfg.apose)
-            # self.skel.load_json('8head')
-            self.skel.load_smplx(self.cfg.smplx_path, gender=self.cfg.gender)
-            self.skel.scale(-10)
+            if self.texture_structure_joint:
+                # skel
+                self.skel = Skeleton(humansd_style=True, apose=self.cfg.apose)
+                # self.skel.load_json('17point')
+                self.skel.load_smplx(self.cfg.smplx_path, gender=self.cfg.gender)
+                #self.skel.scale(-10)
+            else:
+                # skel
+                self.skel = Skeleton(apose=self.cfg.apose)
+                # self.skel.load_json('8head')
+                self.skel.load_smplx(self.cfg.smplx_path, gender=self.cfg.gender)
+                #self.skel.scale(-10)
+
+            
+        self.skel.normalize()
+        self.skel.scale(-10)
+        dev = self.sampled_points_tensor.device
+
+        ntensor = self.sampled_points_tensor.clone().detach().cpu().numpy()
+        tmin = ntensor.min(0)
+        tmax = ntensor.max(0)
+        c = (tmin + tmax) / 2
+        s = 0.6 / (np.max(tmax - tmin))
+        ctensor = torch.tensor(c, device=dev)
+        stensor = torch.tensor(s, device=dev)
+
+        self.sampled_points_tensor = (self.sampled_points_tensor - ctensor) * stensor
+        self.sampled_points_tensor[:, [1, 2]] = self.sampled_points_tensor[:, [2, 1]]
+        self.sampled_points_tensor *= (1.1 ** 10)
+            
         
         self.cameras_extent = 4.0
         
         self.mobilenet = torchvision.models.mobilenet_v2(pretrained=True).eval()
         self.feature_extractor = self.mobilenet.features
+
+        import json
+        with open("smplx_vert_segmentation.json", "r") as j:
+            self.vertexmap = json.load(j)
+        
+        import cubvh
+
+        self.BVH = cubvh.cuBVH(self.skel.vertices, self.skel.faces)
+
+        self.segs = {
+            "full": ["head", "leftEye", "rightEye", "eyeballs", "neck", "leftShoulder", "rightShoulder", "spine", "spine1", "spine2", "leftArm", "leftForeArm", "rightArm", "rightForeArm", "leftHand", "leftHandIndex1", "rightHand", "rightHandIndex1", "hips", "leftLeg", "leftUpLeg", "rightLeg", "rightUpLeg", "leftToeBase", "leftFoot", "rightToeBase", "rightFoot"],
+            "head": ["head", "leftEye", "rightEye", "eyeballs", "neck"],
+            "torso": ["leftShoulder", "rightShoulder", "spine", "spine1", "spine2"],
+            "left_arm": ["leftArm", "leftForeArm"],
+            "right_arm": ["rightArm", "rightForeArm"],
+            "left_hand": ["leftHand", "leftHandIndex1"],
+            "right_hand": ["rightHand", "rightHandIndex1"],
+            "waist": ["hips"],
+            "left_leg": ["leftLeg", "leftUpLeg"],
+            "right_leg": ["rightLeg", "rightUpLeg"],
+            "left_foot": ["leftToeBase", "leftFoot"],
+            "right_foot": ["rightToeBase", "rightFoot"],
+        }
+
+        self.seg_order = [
+                    "head", "torso", "left_arm", "right_arm",
+                    "left_hand", "right_hand", "waist", "left_leg",
+                    "right_leg", "left_foot", "right_foot"      
+                          ]
+        
+        self.cycle_len = len(self.seg_order)
 
     def generate_all_sam_masks_og(self, image_tensor: torch.Tensor):
         """
@@ -397,10 +646,16 @@ class GaussianDreamer(BaseLift3DSystem):
         # pcd = BasicPointCloud(points=all_coords *bound, colors=all_rgb, normals=np.zeros((self.num_pts, 3)))
 
         points = self.skel.sample_smplx_points(N=self.cfg.pts_num)
-        colors = np.ones_like(points) * 0.5
-        pcd = BasicPointCloud(points, colors, None)
+        pcd = None
+        if self.precolor is not None:
+            colors = self.precolor
+            pcd = BasicPointCloud(self.sampled_points_tensor.detach().cpu().numpy(), colors.detach().cpu().numpy(), None)
+        else:
+            colors = np.ones_like(points) * 0.5
+            pcd = BasicPointCloud(points, colors, None)
 
         return pcd
+
     
     def forward(self, batch: Dict[str, Any],renderbackground = None) -> Dict[str, Any]:
 
@@ -412,15 +667,44 @@ class GaussianDreamer(BaseLift3DSystem):
         pose_images = []
         self.viewspace_point_list = []
 
+        cycle = self.true_global_step % self.cycle_len
+        prompt = self.seg_order[cycle]
+        segs = self.segs[prompt]
+
+        if self.true_global_step > 5000:
+            prompt = "full"
+
+        if prompt != "full":
+            points = self.gaussian.get_xyz.detach()
+            mapping_dist, mapping_face, mapping_uvw = self.BVH.signed_distance(
+                points, return_uvw=True, mode="raystab"
+            )
+
         for id in range(batch['c2w'].shape[0]):
        
             viewpoint_cam  = Camera(c2w = batch['c2w'][id],FoVy = batch['fovy'][id],height = batch['height'],width = batch['width'])
 
-            render_pkg = render(viewpoint_cam, self.gaussian, self.pipe, renderbackground)
+            if prompt != "full":
+                idxs = set().union(*[self.vertexmap[seg] for seg in segs])
+
+                faces = self.skel.faces[mapping_face.cpu()]
+                v0, v1, v2 = faces[:, 0], faces[:, 1], faces[:, 2]
+                is_in = torch.tensor(
+                    [
+                        (int(a) in idxs or int(b) in idxs or int(c) in idxs)
+                        for a, b, c in zip(v0, v1, v2)
+                    ],
+                    dtype=torch.bool
+                )
+
+                gaussian_idxs = torch.nonzero(is_in, as_tuple=False).squeeze(1)
+
+                render_pkg = render(viewpoint_cam, self.gaussian, self.pipe, renderbackground, subset_ids=gaussian_idxs)
+            else:
+                render_pkg = render(viewpoint_cam, self.gaussian, self.pipe, renderbackground)
             image, viewspace_point_tensor, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["radii"]
             self.viewspace_point_list.append(viewspace_point_tensor)
 
-            # manually accumulate max radii across batch
             if id == 0:
                 self.radii = radii
             else:
@@ -452,6 +736,58 @@ class GaussianDreamer(BaseLift3DSystem):
                 pose_image = torch.from_numpy(pose_image).to(self.device) # [H, W, 3]
                 pose_images.append(pose_image)
 
+            """
+            head_idx = set(self.vertexmap["head"])
+
+            faces = self.skel.faces[mapping_face.cpu()]
+
+            v0, v1, v2 = faces[:, 0], faces[:, 1], faces[:, 2]
+            is_head = torch.tensor(
+                [(int(a) in head_idx or int(b) in head_idx or int(c) in head_idx)
+                for a, b, c in zip(v0, v1, v2)],
+                dtype=torch.bool,
+            )
+
+            # Step 4: Get the indices of Gaussians belonging to head
+            head_gaussian_indices = torch.nonzero(is_head, as_tuple=False).squeeze(1)
+
+
+            render_pkg = render(viewpoint_cam, self.gaussian, self.pipe, renderbackground, subset_ids=head_gaussian_indices)
+            image, viewspace_point_tensor, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["radii"]
+            self.viewspace_point_list.append(viewspace_point_tensor)
+
+            # manually accumulate max radii across batch
+            if id == 0:
+                self.radii = radii
+            else:
+                self.radii = torch.max(radii, self.radii)
+                
+            depth = render_pkg["depth_3dgs"]
+
+            # import kiui
+            # kiui.vis.plot_image(image)
+
+            depth = depth.permute(1, 2, 0)
+            image = image.permute(1, 2, 0)
+            images.append(image)
+            depths.append(depth)
+            
+            if self.texture_structure_joint:
+                backview = abs(batch['azimuth'][id]) > 120 * np.pi / 180
+                mvp = batch['mvp_mtx'][id].detach().cpu().numpy()  # [4, 4]
+                pose_image, _ = self.skel.humansd_draw(mvp, 512, 512, backview) # [512, 512, 3], fixed pose image resolution
+                # kiui.vis.plot_image(pose_image)
+                pose_image = torch.from_numpy(pose_image).to(self.device) # [H, W, 3]
+                pose_images.append(pose_image)
+            else:
+                # render pose image
+                backview = abs(batch['azimuth'][id]) > 120 * np.pi / 180
+                mvp = batch['mvp_mtx'][id].detach().cpu().numpy()  # [4, 4]
+                pose_image, _ = self.skel.draw(mvp, 512, 512, backview) # [512, 512, 3], fixed pose image resolution
+                # kiui.vis.plot_image(pose_image)
+                pose_image = torch.from_numpy(pose_image).to(self.device) # [H, W, 3]
+                pose_images.append(pose_image)
+            """
 
         images = torch.stack(images, 0)
         depths = torch.stack(depths, 0)
@@ -482,10 +818,13 @@ class GaussianDreamer(BaseLift3DSystem):
         self.prompt_processor = threestudio.find(self.cfg.prompt_processor_type)(
             self.cfg.prompt_processor
         )
+
+        self.prompt_processor.prepare_prompt_options_embeddings(self.prompt_options_json)
         self.guidance = threestudio.find(self.cfg.guidance_type)(self.cfg.guidance)
+
     
     def training_step(self, batch, batch_idx):
-        
+
         self.gaussian.update_learning_rate(self.true_global_step)
         
         if self.true_global_step > self.cfg.half_scheduler_max_step:
@@ -495,7 +834,12 @@ class GaussianDreamer(BaseLift3DSystem):
 
         out = self(batch) 
 
-        prompt_utils = self.prompt_processor()
+        cycle = self.true_global_step % self.cycle_len
+        prompt = self.seg_order[cycle]
+        if self.true_global_step > 5000:
+            prompt = "full"
+
+        prompt_utils = self.prompt_processor(prompt)
         images = out["comp_rgb"]
         depth_images = out['depth']
         depth_min = torch.amin(depth_images, dim=[1, 2, 3], keepdim=True)
@@ -563,109 +907,110 @@ class GaussianDreamer(BaseLift3DSystem):
                     fmap = self.feature_extractor(x224)             # [1,C,h,w]
                 fvec = fmap.mean(dim=[2,3]).squeeze(0)              # [C]
                 fvecs.append(fvec)
-            Ff = torch.stack(fvecs, dim=0)
-            F_norm = Ff / Ff.norm(dim=1, keepdim=True)
-            print(f"features {time.time() - start}")
+            if len(fvecs) > 0:
+                Ff = torch.stack(fvecs, dim=0)
+                F_norm = Ff / Ff.norm(dim=1, keepdim=True)
+                print(f"features {time.time() - start}")
 
-            available = list(range(len(self.scheduled_masks)))  
-            used = set()
-            total_calls = 4  
+                available = list(range(len(self.scheduled_masks)))  
+                used = set()
+                total_calls = 4  
 
-            start = time.time()
+                start = time.time()
 
-            for _call_i in range(total_calls):  
-                # pick from the ones never used yet  
-                avail = [i for i in available if i not in used]  
-                if len(avail) < 1:  
-                    break  
+                for _call_i in range(total_calls):  
+                    # pick from the ones never used yet  
+                    avail = [i for i in available if i not in used]  
+                    if len(avail) < 1:  
+                        break  
 
-                # 1) random anchor  
-                anchor_idx = random.choice(avail)  
-                used.add(anchor_idx)  
+                    # 1) random anchor  
+                    anchor_idx = random.choice(avail)  
+                    used.add(anchor_idx)  
 
-                # 2) find its 3 most similar among the remaining pool  
-                sims = (F_norm[anchor_idx:anchor_idx+1] @ F_norm.T).squeeze(0)  
-                # make sure sims for already-used are -inf so topk skips them  
-                min_val = torch.finfo(sims.dtype).min
-                for u in used:  
-                    sims[u] = min_val  
-                k = min(3, len(avail) - 1)  
-                if k > 0:  
-                    topk = sims.topk(k=k).indices.tolist()  
-                    for t in topk:  
-                        used.add(t)  
-                    selected = [anchor_idx] + topk  
-                else:  
-                    selected = [anchor_idx]  
+                    # 2) find its 3 most similar among the remaining pool  
+                    sims = (F_norm[anchor_idx:anchor_idx+1] @ F_norm.T).squeeze(0)  
+                    # make sure sims for already-used are -inf so topk skips them  
+                    min_val = torch.finfo(sims.dtype).min
+                    for u in used:  
+                        sims[u] = min_val  
+                    k = min(3, len(avail) - 1)  
+                    if k > 0:  
+                        topk = sims.topk(k=k).indices.tolist()  
+                        for t in topk:  
+                            used.add(t)  
+                        selected = [anchor_idx] + topk  
+                    else:  
+                        selected = [anchor_idx]  
 
-                # 3) build your mini-batch of masked RGB/depth/ctrl  
-                rgb_list, d_list, ctrl_list = [], [], []  
-                batch_info = {k: [] for k,v in batch.items() if torch.is_tensor(v) and v.shape[0] == images.shape[0]}  
-                for idx in selected:  
-                    seg, img_idx = self.scheduled_masks[idx]  
-                    m = seg.unsqueeze(-1)  
-                    rgb_list.append((images[img_idx]*m).unsqueeze(0))  
-                    d_list.append((depth_images[img_idx]*m).unsqueeze(0))  
-                    ctrl_list.append(control_images[img_idx:img_idx+1])  
+                    # 3) build your mini-batch of masked RGB/depth/ctrl  
+                    rgb_list, d_list, ctrl_list = [], [], []  
+                    batch_info = {k: [] for k,v in batch.items() if torch.is_tensor(v) and v.shape[0] == images.shape[0]}  
+                    for idx in selected:  
+                        seg, img_idx = self.scheduled_masks[idx]  
+                        m = seg.unsqueeze(-1)  
+                        rgb_list.append((images[img_idx]*m).unsqueeze(0))  
+                        d_list.append((depth_images[img_idx]*m).unsqueeze(0))  
+                        ctrl_list.append(control_images[img_idx:img_idx+1])  
+                        for k in batch_info:  
+                            batch_info[k].append(batch[k][img_idx:img_idx+1])  
+
+                    mi_cat  = torch.cat(rgb_list, dim=0)  
+                    md_cat  = torch.cat(d_list, dim=0)  
+                    ctrl_cat= torch.cat(ctrl_list, dim=0)
+
+                    # mi_vis = mi_cat.permute(0, 3, 1, 2).detach().cpu()
+
+                    # # make a grid of all N masked crops on one row
+                    # grid = make_grid(mi_vis, nrow=mi_vis.size(0), normalize=True, value_range=(0,1))
+
+                    # # choose an output directory (or reuse your existing `out_dir`)
+                    # out_dir = "/n/holylfs05/LABS/pfister_lab/Lab/coxfs01/pfister_lab2/Lab/abenahmedk/interm_vis"
+                    # os.makedirs(out_dir, exist_ok=True)
+
+                    # # save it
+                    # save_image(
+                    #     grid,
+                    #     os.path.join(out_dir, f"selected_masks_step{self.global_step}.png")
+                    # )
+                    # print(f"🔍 Saved selected masked crops to {out_dir}/selected_masks_step{self.global_step}.png")  
                     for k in batch_info:  
-                        batch_info[k].append(batch[k][img_idx:img_idx+1])  
-
-                mi_cat  = torch.cat(rgb_list, dim=0)  
-                md_cat  = torch.cat(d_list, dim=0)  
-                ctrl_cat= torch.cat(ctrl_list, dim=0)
-
-                # mi_vis = mi_cat.permute(0, 3, 1, 2).detach().cpu()
-
-                # # make a grid of all N masked crops on one row
-                # grid = make_grid(mi_vis, nrow=mi_vis.size(0), normalize=True, value_range=(0,1))
-
-                # # choose an output directory (or reuse your existing `out_dir`)
-                # out_dir = "/n/holylfs05/LABS/pfister_lab/Lab/coxfs01/pfister_lab2/Lab/abenahmedk/interm_vis"
-                # os.makedirs(out_dir, exist_ok=True)
-
-                # # save it
-                # save_image(
-                #     grid,
-                #     os.path.join(out_dir, f"selected_masks_step{self.global_step}.png")
-                # )
-                # print(f"🔍 Saved selected masked crops to {out_dir}/selected_masks_step{self.global_step}.png")  
-                for k in batch_info:  
-                    batch_info[k] = torch.cat(batch_info[k], dim=0)  
-                # print(f"{ctrl_cat = }")
-                # # 4) single SDS call  
-                # guidance_out = self.guidance(  
-                #     mi_cat, md_cat, prompt_utils=prompt_utils,  
-                #     control_images=ctrl_cat,  
-                #     **batch_info, rgb_as_latents=False  
-                # )  
-                if self.texture_structure_joint:
-                    # (control, rgb, depth, prompt)
-                    guidance_out = self.guidance(
-                        ctrl_cat,         # control_images
-                        mi_cat,           # rgb
-                        md_cat,           # depth
-                        prompt_utils,     # prompt
-                        **batch_info,
-                        rgb_as_latents=False,
-                    )
-                elif self.controlnet:
-                    # (control, rgb, prompt)
-                    guidance_out = self.guidance(
-                        ctrl_cat,         # control_images
-                        mi_cat,           # rgb
-                        prompt_utils,     # prompt
-                        **batch_info,
-                        rgb_as_latents=False,
-                    )
-                else:
-                    # (rgb, prompt)
-                    guidance_out = self.guidance(
-                        mi_cat,           # rgb
-                        prompt_utils,     # prompt
-                        **batch_info,
-                        rgb_as_latents=False,
-                    )
-                loss += guidance_out['loss_sds'].mean() * self.C(self.cfg.loss['lambda_sds'])  
+                        batch_info[k] = torch.cat(batch_info[k], dim=0)  
+                    # print(f"{ctrl_cat = }")
+                    # # 4) single SDS call  
+                    # guidance_out = self.guidance(  
+                    #     mi_cat, md_cat, prompt_utils=prompt_utils,  
+                    #     control_images=ctrl_cat,  
+                    #     **batch_info, rgb_as_latents=False  
+                    # )  
+                    if self.texture_structure_joint:
+                        # (control, rgb, depth, prompt)
+                        guidance_out = self.guidance(
+                            ctrl_cat,         # control_images
+                            mi_cat,           # rgb
+                            md_cat,           # depth
+                            prompt_utils,     # prompt
+                            **batch_info,
+                            rgb_as_latents=False,
+                        )
+                    elif self.controlnet:
+                        # (control, rgb, prompt)
+                        guidance_out = self.guidance(
+                            ctrl_cat,         # control_images
+                            mi_cat,           # rgb
+                            prompt_utils,     # prompt
+                            **batch_info,
+                            rgb_as_latents=False,
+                        )
+                    else:
+                        # (rgb, prompt)
+                        guidance_out = self.guidance(
+                            mi_cat,           # rgb
+                            prompt_utils,     # prompt
+                            **batch_info,
+                            rgb_as_latents=False,
+                        )
+                    loss += guidance_out['loss_sds'].mean() * self.C(self.cfg.loss['lambda_sds'])  
 
             print(f"rest took {time.time() - start}")
         for name, value in self.cfg.loss.items():
@@ -868,8 +1213,55 @@ class GaussianDreamer(BaseLift3DSystem):
         point_cloud = self.pcb()
         self.gaussian.create_from_pcd(point_cloud, self.cameras_extent)
 
+        """
+        self.skel.normalize()
+        dev = self.gaussian._xyz.device
+
+        center = torch.tensor(self.skel.ori_center, device=dev)
+        scale = torch.tensor(self.skel.ori_scale, device=dev)
+
+        pos = self.gaussian._xyz.detach().clone()
+        pos = (pos - center) * scale
+        pos[:, [1, 2]] = pos[:, [2, 1]]
+        pos *= (1.1 ** 10)
+
+        self.skel.scale(-10)
+
+        self.gaussian._xyz = pos.clone().requires_grad_()
+        """
         self.gaussian.training_setup(opt)
-        
+
+        """
+        if self.use_img:
+            
+            print(f"Extrinsic: {self.extrinsic[0]}")
+            print(f"Intrinsic: {self.intrinsic[0]}")
+
+            self.gaussian.bake_colors_from_image_and_camera(self.image, self.intrinsic, self.extrinsic, self.image.shape[1:3])
+           
+            fy = self.intrinsic[0][1, 1]
+            H = self.image.shape[1]
+            W = self.image.shape[2]
+            FoVy = 2 * math.atan(0.5 * H / fy)
+           
+            cam = Camera(self.extrinsic, FoVy, H, W)
+           
+            rendered = render(cam, self.gaussian, self.pipe, bg_color=torch.tensor([0.0, 0.0, 0.0], device="cuda"))
+           
+            print("Render shape: ", rendered["render"].shape)
+           
+            img_out = rendered["render"].clamp(0, 1).cpu()
+           
+            save_image(img_out, self.get_save_path(f"cameraview.png"))
+           
+            debug_render_splats_and_camera(
+                self.gaussian,
+                torch.inverse(self.extrinsic),
+                self.intrinsic[0],
+                self.image.shape[1:3],
+                save_path=self.get_save_path(f"debug_camera_view.png")
+            )
+            """
         ret = {
             "optimizer": self.gaussian.optimizer,
         }
