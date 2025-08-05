@@ -41,6 +41,7 @@ from PIL import Image
 from threestudio.utils.poser import Skeleton
 import torch.nn.functional as F
 
+"""
 def load_ply(path,save_path):
     C0 = 0.28209479177387814
     def SH2RGB(sh):
@@ -61,7 +62,7 @@ def load_ply(path,save_path):
     point_cloud.points = o3d.utility.Vector3dVector(xyz)
     point_cloud.colors = o3d.utility.Vector3dVector(color)
     o3d.io.write_point_cloud(save_path, point_cloud)
-
+"""
 def storePly(path, xyz, rgb):
     # Define the dtype for the structured array
     dtype = [('x', 'f4'), ('y', 'f4'), ('z', 'f4'),
@@ -252,9 +253,11 @@ class GaussianDreamer(BaseLift3DSystem):
         self.controlnet = self.cfg.controlnet
 
         # old method with /thirdparty/
+        """
         self.sam = sam_model_registry['vit_h'](checkpoint='/n/holylfs05/LABS/pfister_lab/Lab/coxfs01/pfister_lab2/Lab/abenahmedk/sam/sam_vit_h_4b8939.pth')
         self.sam.to("cuda")
         self.mask_generator = SamAutomaticMaskGenerator(self.sam)
+        """
         #self.mask_generator = SamPredictor(self.sam)
 
         # self._device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -408,11 +411,12 @@ class GaussianDreamer(BaseLift3DSystem):
         
         self.cycle_len = len(self.seg_order)
 
+    """
     def generate_all_sam_masks_og(self, image_tensor: torch.Tensor):
-        """
+        COMMENT
         image_tensor: [B, H, W, 3] floats in [0,1]
         Produces self.scheduled_masks as a list of 2D masks (H×W), filtered by size.
-        """
+        COMMENT
         start_time = time.time()
         B, H, W, C = image_tensor.shape
         all_masks = []
@@ -459,10 +463,10 @@ class GaussianDreamer(BaseLift3DSystem):
         self.scheduled_masks = all_masks    
     
     def generate_all_sam_masks_old(self, image_tensor: torch.Tensor):
-        """
+        COMMENT
         image_tensor: [B, H, W, 3] floats in [0,1]
         Produces self.scheduled_masks as a list of 2D masks (H×W), filtered by size.
-        """
+        COMMENT
         start = time.time()
         device = next(self.sam_model.parameters()).device
         B, H, W, C = image_tensor.shape
@@ -547,7 +551,7 @@ class GaussianDreamer(BaseLift3DSystem):
                 all_masks.append((mask_tensor, i) if self.masking_each_own else mask_tensor)
 
         self.scheduled_masks = all_masks
-
+    """
 
     def save_gif_to_file(self,images, output_file):  
         with io.BytesIO() as writer:  
@@ -557,7 +561,7 @@ class GaussianDreamer(BaseLift3DSystem):
             writer.seek(0)  
             with open(output_file, 'wb') as file:  
                 file.write(writer.read())
-    
+    """
     def shape(self):
 
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -636,7 +640,8 @@ class GaussianDreamer(BaseLift3DSystem):
         all_coords = np.concatenate([all_coords,coords],axis=0)
         all_rgb = np.concatenate([all_rgb,rgb],axis=0)
         return all_coords,all_rgb
-    
+    """
+
     def pcb(self):
         # Since this data set has no colmap data, we start with random points
 
