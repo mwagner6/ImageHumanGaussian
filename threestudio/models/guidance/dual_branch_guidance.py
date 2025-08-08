@@ -366,6 +366,14 @@ class StableDiffusionGuidance(BaseObject):
             whole_latents = (whole_latents - whole_mean) / whole_std * rgb_std + rgb_mean
             whole_latents_input = torch.cat([whole_latents] * 3)
 
+            if latent_model_input.shape[2:] != whole_latents_input.shape[2:]:
+                whole_latents_input = F.interpolate(
+                    whole_latents_input,
+                    size=latent_model_input.shape[2:],  # Match H and W
+                    mode='bilinear',
+                    align_corners=False
+                )
+
             noisy_latents_with_cond = torch.cat([latent_model_input, whole_latents_input], dim=1).to(self.weights_dtype)
             noisy_latents_list = [torch.cat([midas_depth_latent_model_input, whole_latents_input], dim=1).to(self.weights_dtype)]
 
@@ -527,6 +535,14 @@ class StableDiffusionGuidance(BaseObject):
             whole_latents = self.encode_images(control_image.to(self.weights_dtype))
             whole_latents = (whole_latents - whole_mean) / whole_std * rgb_std + rgb_mean
             whole_latents_input = torch.cat([whole_latents] * 2)
+
+            if latent_model_input.shape[2:] != whole_latents_input.shape[2:]:
+                    whole_latents_input = F.interpolate(
+                        whole_latents_input,
+                        size=latent_model_input.shape[2:],  # Match H and W
+                        mode='bilinear',
+                        align_corners=False
+                    )
 
             noisy_latents_with_cond = torch.cat([latent_model_input, whole_latents_input], dim=1).to(self.weights_dtype)
             noisy_latents_list = [torch.cat([midas_depth_latent_model_input, whole_latents_input], dim=1).to(self.weights_dtype)]
@@ -690,6 +706,14 @@ class StableDiffusionGuidance(BaseObject):
             whole_latents = self.encode_images(control_image.to(self.weights_dtype))
             whole_latents = (whole_latents - whole_mean) / whole_std * rgb_std + rgb_mean
             whole_latents_input = torch.cat([whole_latents] * 2)
+
+            if latent_model_input.shape[2:] != whole_latents_input.shape[2:]:
+                whole_latents_input = F.interpolate(
+                    whole_latents_input,
+                    size=latent_model_input.shape[2:],  # Match H and W
+                    mode='bilinear',
+                    align_corners=False
+                )
 
             noisy_latents_with_cond = torch.cat([latent_model_input, whole_latents_input], dim=1).to(self.weights_dtype)
             noisy_latents_list = [torch.cat([midas_depth_latent_model_input, whole_latents_input], dim=1).to(self.weights_dtype)]
@@ -909,6 +933,13 @@ class StableDiffusionGuidance(BaseObject):
         whole_latents_input = torch.cat([whole_latents] * 2)
 
         # print(latent_model_input.shape, midas_depth_latent_model_input.shape, whole_latents_input.shape)
+        if latent_model_input.shape[2:] != whole_latents_input.shape[2:]:
+            whole_latents_input = F.interpolate(
+                whole_latents_input,
+                size=latent_model_input.shape[2:],  # Match H and W
+                mode='bilinear',
+                align_corners=False
+            )
 
         noisy_latents_with_cond = torch.cat([latent_model_input, whole_latents_input], dim=1).to(self.weights_dtype)
         noisy_latents_list = [torch.cat([midas_depth_latent_model_input, whole_latents_input], dim=1).to(self.weights_dtype)]

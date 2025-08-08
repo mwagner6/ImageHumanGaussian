@@ -26,6 +26,7 @@ import cv2
 from torchvision.utils import make_grid, save_image
 from segment_anything import sam_model_registry, SamAutomaticMaskGenerator, SamPredictor
 
+
 # from transformers import SamProcessor, SamModel
 # import torch.nn.functional as F
 
@@ -235,6 +236,7 @@ class GaussianDreamer(BaseLift3DSystem):
         bg_white: bool = False
         use_img: bool = False
         img_path: str = ""
+        full_spans: list[list[int]] = field(default_factory=list)
 
         prompt_options_json: Optional[dict] = None
 
@@ -388,10 +390,13 @@ class GaussianDreamer(BaseLift3DSystem):
 
         self.BVH = cubvh.cuBVH(self.skel.vertices, self.skel.faces)
 
+        self.handsegs = ["leftHand", "leftHandIndex1", "rightHand", "rightHandIndex1"]
+
         self.segs = {
             "full": ["head", "leftEye", "rightEye", "eyeballs", "neck", "leftShoulder", "rightShoulder", "spine", "spine1", "spine2", "leftArm", "leftForeArm", "rightArm", "rightForeArm", "leftHand", "leftHandIndex1", "rightHand", "rightHandIndex1", "hips", "leftLeg", "leftUpLeg", "rightLeg", "rightUpLeg", "leftToeBase", "leftFoot", "rightToeBase", "rightFoot"],
             "head": ["head", "leftEye", "rightEye", "eyeballs", "neck"],
-            "torso": ["leftShoulder", "rightShoulder", "spine", "spine1", "spine2"],
+            "chest": ["leftShoulder", "rightShoulder", "spine", "spine1", "spine2"],
+            "back": ["leftShoulder", "rightShoulder", "spine", "spine1", "spine2"],
             "left_arm": ["leftArm", "leftForeArm"],
             "right_arm": ["rightArm", "rightForeArm"],
             "left_hand": ["leftHand", "leftHandIndex1"],
@@ -404,7 +409,7 @@ class GaussianDreamer(BaseLift3DSystem):
         }
 
         self.seg_order = [
-                    "head", "torso", "left_arm", "right_arm",
+                    "head", "chest", "back", "left_arm", "right_arm",
                     "left_hand", "right_hand", "waist", "left_leg",
                     "right_leg", "left_foot", "right_foot"      
                           ]
@@ -676,23 +681,51 @@ class GaussianDreamer(BaseLift3DSystem):
         prompt = self.seg_order[cycle]
         segs = self.segs[prompt]
 
-        if self.true_global_step > 5000:
-            prompt = "full"
+        for span in self.cfg.full_spans:
+            if self.true_global_step > span[0] and self.true_global_step < span[1]:
+                prompt = "full"
 
         if prompt != "full":
             points = self.gaussian.get_xyz.detach()
-            mapping_dist, mapping_face, mapping_uvw = self.BVH.signed_distance(
+            _, self.mapping_face, _ = self.BVH.signed_distance(
                 points, return_uvw=True, mode="raystab"
             )
 
+
+        H, W = batch['height'], batch['width']
+        empty_image = torch.zeros((H, W, 3), device=self.device)
+        empty_depth = torch.zeros((H, W, 1), device=self.device)
+        empty_pose = torch.zeros((512, 512, 3), device=self.device)
+
+        render_pkg = None
+
         for id in range(batch['c2w'].shape[0]):
-       
+            """
+            if prompt != "full" and (batch["elevation"][id] < -10 or batch["elevation"][id] > 30):
+                continue
+            """
+            if (prompt == "chest" and (batch["azimuth"][id] > 0)) or (prompt == "back" and (batch["azimuth"][id] < 0)):
+                images.append(empty_image)
+                depths.append(empty_depth)
+                pose_images.append(empty_pose)
+                num_gaussians = self.gaussian.get_xyz.shape[0]
+                empty_viewpoint = torch.zeros((num_gaussians, 3), device=self.device, requires_grad=True)
+                empty_viewpoint.retain_grad()
+                empty_viewpoint.grad = torch.zeros_like(empty_viewpoint)
+                self.viewspace_point_list.append(empty_viewpoint)
+                print("Skipping")
+                print("Image shape: ", empty_image.shape)
+                print("Depth shape: ", empty_depth.shape)
+                print("Pose_image shape: ", empty_pose.shape)
+                print("Empty viewpoint shape: ", empty_viewpoint.shape)
+                continue
+             
             viewpoint_cam  = Camera(c2w = batch['c2w'][id],FoVy = batch['fovy'][id],height = batch['height'],width = batch['width'])
 
             if prompt != "full":
                 idxs = set().union(*[self.vertexmap[seg] for seg in segs])
 
-                faces = self.skel.faces[mapping_face.cpu()]
+                faces = self.skel.faces[self.mapping_face.cpu()]
                 v0, v1, v2 = faces[:, 0], faces[:, 1], faces[:, 2]
                 is_in = torch.tensor(
                     [
@@ -707,9 +740,11 @@ class GaussianDreamer(BaseLift3DSystem):
                 render_pkg = render(viewpoint_cam, self.gaussian, self.pipe, renderbackground, subset_ids=gaussian_idxs)
             else:
                 render_pkg = render(viewpoint_cam, self.gaussian, self.pipe, renderbackground)
+            print("Render_pkg keys: ", [key for key in render_pkg])
             image, viewspace_point_tensor, radii = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["radii"]
             self.viewspace_point_list.append(viewspace_point_tensor)
-
+            print("Not skipping")
+            print("Viewspace point shape: ", viewspace_point_tensor.shape)
             if id == 0:
                 self.radii = radii
             else:
@@ -723,7 +758,10 @@ class GaussianDreamer(BaseLift3DSystem):
             depth = depth.permute(1, 2, 0)
             image = image.permute(1, 2, 0)
             images.append(image)
+            
+            print("image shape: ", image.shape)
             depths.append(depth)
+            print("Depth shape: ", depth.shape)
 
             if self.texture_structure_joint:
                 backview = abs(batch['azimuth'][id]) > 120 * np.pi / 180
@@ -731,6 +769,7 @@ class GaussianDreamer(BaseLift3DSystem):
                 pose_image, _ = self.skel.humansd_draw(mvp, 512, 512, backview) # [512, 512, 3], fixed pose image resolution
                 # kiui.vis.plot_image(pose_image)
                 pose_image = torch.from_numpy(pose_image).to(self.device) # [H, W, 3]
+                print("Pose image shape: ", pose_image.shape)
                 pose_images.append(pose_image)
             else:
                 # render pose image
@@ -808,6 +847,40 @@ class GaussianDreamer(BaseLift3DSystem):
             hand_mask = distance.min(dim=-1).values < self.cfg.hand_radius # [N]
             self.visibility_filter = self.visibility_filter & (~hand_mask)
 
+        if render_pkg is None:
+            batch_size = batch['c2w'].shape[0]
+            H, W = batch['height'], batch['width']
+            num_gaussians = self.gaussian.get_xyz.shape[0]
+
+            # Per-view zeros matching normal outputs
+            zero_like_param = self.gaussian.get_xyz.sum() * 0.0
+            images = torch.zeros((batch_size, H, W, 3), device=self.device, requires_grad=True) + zero_like_param
+            depths = torch.zeros((batch_size, H, W, 1), device=self.device, requires_grad=True)
+            pose_images = torch.zeros((batch_size, 512, 512, 3), device=self.device, requires_grad=True)  # fixed pose size
+
+            # Viewspace points list
+            self.viewspace_point_list = []
+            for _ in range(batch_size):
+                vp = torch.zeros((num_gaussians, 3), device=self.device, requires_grad=True)
+                vp.retain_grad()
+                vp.grad = torch.zeros_like(vp)
+                self.viewspace_point_list.append(vp)
+
+            # Build a render_pkg dict with all expected keys
+            render_pkg = {
+                "comp_rgb": images,
+                "depth": depths,
+                "pose": pose_images,
+                "opacity": torch.zeros((batch_size, H, W, 1), device=self.device, requires_grad=True),
+                # Include other keys with sensible shapes if downstream uses them:
+                "render": images.permute(0, 3, 1, 2),  # e.g. if 'render' is channel-first
+                "viewspace_points": torch.zeros((num_gaussians, 3), device=self.device, requires_grad=True),
+                "radii": torch.zeros((num_gaussians,), device=self.device, requires_grad=True),
+            }
+
+            return render_pkg
+
+
         render_pkg["comp_rgb"] = images
         render_pkg["depth"] = depths
         render_pkg['pose'] = pose_images
@@ -841,8 +914,9 @@ class GaussianDreamer(BaseLift3DSystem):
 
         cycle = self.true_global_step % self.cycle_len
         prompt = self.seg_order[cycle]
-        if self.true_global_step > 5000:
-            prompt = "full"
+        for span in self.cfg.full_spans:
+            if self.true_global_step > span[0] and self.true_global_step < span[1]:
+                prompt = "full"
 
         prompt_utils = self.prompt_processor(prompt)
         images = out["comp_rgb"]
@@ -886,7 +960,6 @@ class GaussianDreamer(BaseLift3DSystem):
         loss += loss_opaque * self.C(self.cfg.loss.lambda_opaque)
 
         if not self.masking:
-            print("We are not masking")
             if guidance_eval:
                 self.guidance_evaluation_save(
                     out["comp_rgb"].detach()[: guidance_out["eval"]["bs"]],
@@ -1023,6 +1096,25 @@ class GaussianDreamer(BaseLift3DSystem):
         return {"loss": loss}
 
     def on_before_optimizer_step(self, optimizer):
+
+        with torch.no_grad():
+            idxs = set().union(*[self.vertexmap[seg] for seg in self.handsegs]) 
+
+            faces = self.skel.faces[self.mapping_face.cpu()]
+            v0, v1, v2 = faces[:, 0], faces[:, 1], faces[:, 2]
+            is_in = torch.tensor(
+                [
+                    (int(a) in idxs or int(b) in idxs or int(c) in idxs)
+                    for a, b, c in zip(v0, v1, v2)
+                ],
+                dtype=torch.bool
+            )
+
+            gaussian_idxs = torch.nonzero(is_in, as_tuple=False).squeeze(1)
+
+            if self.gaussian._xyz.grad is not None:
+                self.gaussian._xyz.grad[gaussian_idxs] = 0.0
+
 
         # return
 

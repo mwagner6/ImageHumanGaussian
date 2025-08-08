@@ -127,7 +127,8 @@ def main(args, extras) -> None:
                                         {
                                             "full": " **description of the person overall** ",
                                             "head": " **description of the person's head area** ",
-                                            "torso": " **description of the person's torso, specify what features are on the front and back** ",
+                                            "chest": " **description of the person's chest and torso from the front** ",
+                                            "back": " **description of the person's back from behind** ",
                                             "left_arm": " **description of the person's left arm** ",
                                             "right_arm": " **description of the person's right arm** ",
                                             "left_hand": " **description of the person's left hand** ",

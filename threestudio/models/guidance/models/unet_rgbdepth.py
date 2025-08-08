@@ -17,6 +17,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import torch
 import torch.nn as nn
 import torch.utils.checkpoint
+import numpy as np
 
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import UNet2DConditionLoadersMixin
@@ -941,7 +942,11 @@ class UNet2DConditionModel(ModelMixin, ConfigMixin, UNet2DConditionLoadersMixin)
             aug_emb, hint = self.add_embedding(image_embs, hint)
             sample = torch.cat([sample, hint], dim=1)
 
-        emb = emb + aug_emb if aug_emb is not None else emb
+        if aug_emb.shape[0] > emb.shape[0]:
+            aug_emb = aug_emb[:emb.shape[0]]
+        else:
+            aug_emb = aug_emb.repeat(int(np.ceil(emb.shape[0]/aug_emb.shape[0])), 1)[:emb.shape[0]]
+        emb = emb + aug_emb
 
         if self.time_embed_act is not None:
             emb = self.time_embed_act(emb)

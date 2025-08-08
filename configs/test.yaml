@@ -1,4 +1,4 @@
-name: "trump"
+name: "handfixed_noprune"
 tag: "${rmspace:${system.prompt_processor.prompt},_}"
 exp_root_dir: "/n/netscratch/pfister_lab/Everyone/mwagner"
 seed: 0
@@ -14,7 +14,7 @@ data:
   # resolution_milestones: [600]
   eval_height: 1024
   eval_width: 1024
-  elevation_range: [-30, 30]
+  elevation_range: [-10, 10]
 
   enable_near_head_poses: true
   head_offset: 0.65
@@ -47,14 +47,15 @@ system:
   size_threshold: 20
   max_grad: 0.0002
   gender: 'neutral'
-  prune_only_start_step: 4700
-  prune_only_end_step: 5300
+  prune_only_start_step: 8000
+  prune_only_end_step: 8600
   prune_only_interval: 300
   prune_size_threshold: 0.008
   apose: true
   bg_white: false
   use_img: true
   img_path: "/n/home09/mwagner/trump.jpg"
+  full_spans: []
 
   prompt_processor_type: "texture-structure-prompt-processor"
   prompt_processor:
