@@ -80,10 +80,14 @@ class StableDiffusionGuidance(BaseObject):
         target_size: int = 1024
         grad_clip_pixel: bool = False
         grad_clip_threshold: float = 0.1
+        img_path: Optional[str] = None
 
     cfg: Config
+    context_image = None
+    image_embeds = None
 
     def configure(self) -> None:
+
         threestudio.info(f"Loading Texture-Structure Joint Model ...")
 
         self.weights_dtype = (
@@ -140,6 +144,14 @@ class StableDiffusionGuidance(BaseObject):
         for p in self.unet.parameters():
             p.requires_grad_(False)
 
+        
+        if self.cfg.img_path is not None:
+            from PIL import Image
+            img = Image.open(self.cfg.img_path).convert("RGB")
+            self.context_image = self._preprocess_context(img)
+
+            self.image_embeds = self.vae.encode(self.context_image).latent_dist.sample() * 0.18215
+
         if self.cfg.token_merging:
             import tomesd
 
@@ -187,10 +199,12 @@ class StableDiffusionGuidance(BaseObject):
 
         self.grad_clip_val: Optional[float] = None
 
-        # self.controlnet = ControlNetModel.from_pretrained(
-        #     self.cfg.controlnet_model, 
-        #     torch_dtype=self.weights_dtype
-        # ).to(self.device)
+        from diffusers import ControlNetModel
+
+        self.controlnet = ControlNetModel.from_pretrained(
+           self.cfg.controlnet_model, 
+            torch_dtype=self.weights_dtype
+        ).to(self.device)
 
         threestudio.info(f"Loaded Texture-Structure Joint Model !")
 
@@ -211,29 +225,35 @@ class StableDiffusionGuidance(BaseObject):
     ) -> Float[Tensor, "..."]:
         input_dtype = noisy_latents_with_cond.dtype
 
-        return self.unet(
-            noisy_latents_with_cond.to(self.weights_dtype),
-            noisy_latents_list,
-            t.to(self.weights_dtype), 
-            encoder_hidden_states=encoder_hidden_states.to(self.weights_dtype),
-            added_cond_kwargs=unet_added_conditions,
-        ).sample.to(input_dtype)
+        if self.image_embeds is not None:
+            # ControlNet-style conditioning
+            down_samples, mid_sample = self.controlnet(
+                noisy_latents_with_cond.to(self.weights_dtype),
+                t.to(self.weights_dtype),
+                encoder_hidden_states=encoder_hidden_states.to(self.weights_dtype),
+                controlnet_cond=self.image_embeds.to(self.weights_dtype), 
+                return_dict=False,
+            )
 
-        # down_samples, mid_sample = self.controlnet(
-        #     latents.to(self.weights_dtype),
-        #     t.to(self.weights_dtype),
-        #     encoder_hidden_states=encoder_hidden_states.to(self.weights_dtype),
-        #     controlnet_cond=control_image.to(self.weights_dtype), 
-        #     return_dict=False,
-        # )
+            return self.unet(
+                noisy_latents_with_cond.to(self.weights_dtype),
+                noisy_latents_list,
+                t.to(self.weights_dtype),
+                encoder_hidden_states=encoder_hidden_states.to(self.weights_dtype),
+                down_block_additional_residuals=down_samples, 
+                mid_block_additional_residual=mid_sample,
+                added_cond_kwargs=unet_added_conditions,
+            ).sample.to(input_dtype)
 
-        # return self.unet(
-        #     latents.to(self.weights_dtype),
-        #     t.to(self.weights_dtype),
-        #     encoder_hidden_states=encoder_hidden_states.to(self.weights_dtype),
-        #     down_block_additional_residuals=down_samples, 
-        #     mid_block_additional_residual=mid_sample,
-        # ).sample.to(input_dtype)
+        else:
+            # No image guidance, default path
+            return self.unet(
+                noisy_latents_with_cond.to(self.weights_dtype),
+                noisy_latents_list,
+                t.to(self.weights_dtype), 
+                encoder_hidden_states=encoder_hidden_states.to(self.weights_dtype),
+                added_cond_kwargs=unet_added_conditions,
+            ).sample.to(input_dtype)
 
     @torch.cuda.amp.autocast(enabled=False)
     def encode_images(
@@ -260,6 +280,25 @@ class StableDiffusionGuidance(BaseObject):
         image = self.vae.decode(latents.to(self.weights_dtype)).sample
         image = (image * 0.5 + 0.5).clamp(0, 1)
         return image.to(input_dtype)
+
+    def _preprocess_context(self, image):
+        import torchvision.transforms as T
+        
+        transform = T.Compose([
+            T.Resize((512, 512)),
+            T.ToTensor(),
+            T.Normalize([0.5], [0.5])  # Stable Diffusion expects [-1,1]
+        ])
+        
+        if isinstance(image, torch.Tensor):
+            # Convert to PIL for consistent transform handling
+            from torchvision.transforms.functional import to_pil_image
+            image = to_pil_image(image.cpu())
+        
+        img = transform(image)
+        return img.unsqueeze(0).to(self.device)
+
+
     
     def compute_grad_anpg(
         self,

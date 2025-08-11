@@ -110,6 +110,9 @@ def main(args, extras) -> None:
             key = config.get('key')
         
         XAI_KEY = key
+
+        cfg.system.guidance.img_path = cfg.system.img_path
+
         with open(cfg.system.img_path, 'rb') as img:
             img_bytes = img.read()
             img_b64 = base64.b64encode(img_bytes).decode('utf8')

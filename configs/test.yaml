@@ -82,6 +82,7 @@ system:
     enable_memory_efficient_attention: true
     grad_clip_pixel: true
     grad_clip_threshold: 1.0
+    img_path: ""
 
   loggers:
     wandb:
