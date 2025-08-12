@@ -81,6 +81,11 @@ class StableDiffusionGuidance(BaseObject):
         grad_clip_pixel: bool = False
         grad_clip_threshold: float = 0.1
         img_path: Optional[str] = None
+        use_ip_adapter: bool = True  
+        ip_adapter_model: str = "h94/IP-Adapter"
+        ip_adapter_subfolder: str = "models"
+        ip_adapter_weight_name: str = "ip-adapter_sd15.bin"
+        ip_adapter_scale: float = 0.6
 
     cfg: Config
     context_image = None
@@ -144,13 +149,27 @@ class StableDiffusionGuidance(BaseObject):
         for p in self.unet.parameters():
             p.requires_grad_(False)
 
-        
-        if self.cfg.img_path is not None:
-            from PIL import Image
-            img = Image.open(self.cfg.img_path).convert("RGB")
-            self.context_image = self._preprocess_context(img)
+        from transformers import CLIPVisionModel, CLIPImageProcessor
 
-            self.image_embeds = self.vae.encode(self.context_image).latent_dist.sample() * 0.18215
+        threestudio.info("Loading CLIP vision model for IP-Adapter...")
+        self.image_encoder = CLIPVisionModel.from_pretrained(
+            "openai/clip-vit-base-patch16",
+            torch_dtype=self.weights_dtype
+        ).to(self.device)
+
+        # Use manual preprocessing instead of CLIPImageProcessor
+        import torchvision.transforms as T
+        self.clip_transform = T.Compose([
+            T.Resize((224, 224), interpolation=T.InterpolationMode.BICUBIC),
+            T.CenterCrop(224),
+            T.ToTensor(),
+            T.Normalize((0.48145466, 0.4578275, 0.40821073), (0.26862954, 0.26130258, 0.27577711)),
+        ])
+
+        self.clip_image_processor = None
+
+        
+        
 
         if self.cfg.token_merging:
             import tomesd
@@ -199,12 +218,98 @@ class StableDiffusionGuidance(BaseObject):
 
         self.grad_clip_val: Optional[float] = None
 
-        from diffusers import ControlNetModel
+        
 
-        self.controlnet = ControlNetModel.from_pretrained(
-           self.cfg.controlnet_model, 
-            torch_dtype=self.weights_dtype
-        ).to(self.device)
+
+        from huggingface_hub import hf_hub_download
+        import safetensors
+        # Download IP-Adapter weights
+        ip_adapter_path = hf_hub_download(
+            repo_id=self.cfg.ip_adapter_model,
+            filename=f"{self.cfg.ip_adapter_subfolder}/{self.cfg.ip_adapter_weight_name}",
+            cache_dir=None  # Use default cache
+        )
+        
+        # Load the state dict
+        state_dict = safetensors.torch.load_file(ip_adapter_path, device="cpu")
+        
+        # Extract image projection layers
+        image_proj_state_dict = {}
+        attn_proc_state_dict = {}
+        
+        for key, value in state_dict.items():
+            if key.startswith("image_proj"):
+                image_proj_state_dict[key.replace("image_proj.", "")] = value
+            elif key.startswith("ip_adapter"):
+                attn_proc_state_dict[key.replace("ip_adapter.", "")] = value
+        
+        # Create image projection network
+        # This is a simple linear projection - you might need to adjust based on your IP-Adapter version
+        cross_attention_dim = self.unet.config.cross_attention_dim
+        clip_embeddings_dim = self.image_encoder.config.hidden_size
+        
+        self.image_proj_model = torch.nn.Sequential(
+            torch.nn.Linear(clip_embeddings_dim, cross_attention_dim),
+            torch.nn.LayerNorm(cross_attention_dim)
+        ).to(self.device, dtype=self.weights_dtype)
+        
+        # Load image projection weights
+        if image_proj_state_dict:
+            self.image_proj_model.load_state_dict(image_proj_state_dict)
+        
+        # Set up attention processors for IP-Adapter
+        attn_procs = {}
+        for name in self.unet.attn_processors.keys():
+            cross_attention_dim = None if name.endswith("attn1.processor") else self.unet.config.cross_attention_dim
+            if name.startswith("mid_block"):
+                hidden_size = self.unet.config.block_out_channels[-1]
+            elif name.startswith("up_blocks"):
+                block_id = int(name[len("up_blocks.")])
+                hidden_size = list(reversed(self.unet.config.block_out_channels))[block_id]
+            elif name.startswith("down_blocks"):
+                block_id = int(name[len("down_blocks.")])
+                hidden_size = self.unet.config.block_out_channels[block_id]
+            
+            if cross_attention_dim is None:
+                attn_procs[name] = self.unet.attn_processors[name]
+            else:
+                attn_procs[name] = IPAdapterAttnProcessor(
+                    hidden_size=hidden_size,
+                    cross_attention_dim=cross_attention_dim,
+                    scale=self.cfg.ip_adapter_scale,
+                    num_tokens=4,  # Number of image tokens, adjust as needed
+                ).to(self.device, dtype=self.weights_dtype)
+        
+        self.unet.set_attn_processor(attn_procs)
+        
+        # Load attention processor weights
+        if attn_proc_state_dict:
+            # Map the state dict keys to the correct attention processors
+            for name, attn_proc in self.unet.attn_processors.items():
+                if isinstance(attn_proc, IPAdapterAttnProcessor):
+                    # Load weights for this specific attention processor
+                    proc_state_dict = {}
+                    for key, value in attn_proc_state_dict.items():
+                        if name in key:
+                            new_key = key.replace(f"{name}.", "")
+                            proc_state_dict[new_key] = value
+                    
+                    if proc_state_dict:
+                        attn_proc.load_state_dict(proc_state_dict, strict=False)
+        
+        threestudio.info("IP-Adapter loaded successfully!")
+            
+
+
+        if self.cfg.img_path is not None:
+            from PIL import Image
+            img = Image.open(self.cfg.img_path).convert("RGB")
+            # Process for IP-Adapter - encode with CLIP and project
+            self.image_embeds = self._encode_ip_adapter_image(img)
+            if self.image_embeds is not None:
+                print("Image embeddings shape: ", self.image_embeds.shape)
+            else:
+                print("Failed to generate image embeddings")
 
         threestudio.info(f"Loaded Texture-Structure Joint Model !")
 
@@ -216,7 +321,6 @@ class StableDiffusionGuidance(BaseObject):
     @torch.cuda.amp.autocast(enabled=False)
     def forward_unet(
         self,
-        # control_image: Float[Tensor, "..."],
         noisy_latents_with_cond: Float[Tensor, "..."],
         noisy_latents_list: List,
         t: Float[Tensor, "..."],
@@ -225,24 +329,16 @@ class StableDiffusionGuidance(BaseObject):
     ) -> Float[Tensor, "..."]:
         input_dtype = noisy_latents_with_cond.dtype
 
-        if self.image_embeds is not None:
-            # ControlNet-style conditioning
-            down_samples, mid_sample = self.controlnet(
-                noisy_latents_with_cond.to(self.weights_dtype),
-                t.to(self.weights_dtype),
-                encoder_hidden_states=encoder_hidden_states.to(self.weights_dtype),
-                controlnet_cond=self.image_embeds.to(self.weights_dtype), 
-                return_dict=False,
-            )
-
+        if hasattr(self, 'image_embeds') and self.image_embeds is not None:
+            # Use IP-Adapter image conditioning
             return self.unet(
                 noisy_latents_with_cond.to(self.weights_dtype),
                 noisy_latents_list,
                 t.to(self.weights_dtype),
                 encoder_hidden_states=encoder_hidden_states.to(self.weights_dtype),
-                down_block_additional_residuals=down_samples, 
-                mid_block_additional_residual=mid_sample,
                 added_cond_kwargs=unet_added_conditions,
+                # IP-Adapter image embeddings are passed through the attention processors
+                cross_attention_kwargs={"ip_adapter_image_embeds": self.image_embeds.repeat(noisy_latents_with_cond.shape[0], 1, 1)} if self.image_embeds is not None else None,
             ).sample.to(input_dtype)
 
         else:
@@ -298,7 +394,41 @@ class StableDiffusionGuidance(BaseObject):
         img = transform(image)
         return img.unsqueeze(0).to(self.device)
 
+    # Replace the _preprocess_controlnet_image method with these IP-Adapter methods:
 
+    def _preprocess_ip_adapter_image(self, image):
+        """Preprocess image for IP-Adapter (CLIP vision model)"""
+        if isinstance(image, torch.Tensor):
+            from torchvision.transforms.functional import to_pil_image
+            image = to_pil_image(image.cpu())
+        
+        # Use CLIP image processor if available, otherwise use manual transform
+        if hasattr(self, 'clip_image_processor') and self.clip_image_processor is not None:
+            processed = self.clip_image_processor(images=image, return_tensors="pt")
+            return processed.pixel_values.to(self.device)
+        else:
+            # Fallback to manual preprocessing
+            processed = self.clip_transform(image).unsqueeze(0)
+            return processed.to(self.device)
+
+    def _encode_ip_adapter_image(self, image):
+        """Encode image using CLIP vision model and project for IP-Adapter"""
+        if self.image_encoder is None or self.image_proj_model is None:
+            return None
+            
+        with torch.no_grad():
+            # Preprocess image
+            preprocessed = self._preprocess_ip_adapter_image(image)
+            
+            # Encode with CLIP
+            clip_image_embeds = self.image_encoder(
+                preprocessed.to(self.weights_dtype)
+            ).last_hidden_state
+            
+            # Project to cross-attention dimension
+            image_embeds = self.image_proj_model(clip_image_embeds)
+            
+        return image_embeds
     
     def compute_grad_anpg(
         self,
