@@ -99,6 +99,46 @@ def main(args, extras) -> None:
     cfg: ExperimentConfig
     cfg = load_config(args.config, cli_args=extras, n_gpus=n_gpus)
 
+    # Handle video input for SMPL extraction
+    video_pose_sequence_path = None
+    if hasattr(cfg.system, 'use_video') and cfg.system.use_video:
+        from threestudio.utils.video_smpl_extractor import extract_smpl_from_video
+
+        video_path = cfg.system.video_path
+        print(f"\n{'='*60}")
+        print(f"VIDEO MODE: Processing video for SMPL pose extraction")
+        print(f"Video path: {video_path}")
+        print(f"{'='*60}\n")
+
+        # Extract SMPL poses from all frames
+        # This will save a .npz file with pose sequences
+        output_dir = cfg.trial_dir
+        first_frame, first_frame_smpl, pose_sequence_path = extract_smpl_from_video(
+            video_path,
+            output_dir,
+            batch_size=4
+        )
+
+        # Store paths for later use
+        video_pose_sequence_path = pose_sequence_path
+        cfg.system.video_pose_sequence_path = pose_sequence_path
+
+        # Save first frame as image for the existing pipeline
+        first_frame_path = os.path.join(output_dir, "first_frame.jpg")
+        import torchvision
+        torchvision.utils.save_image(first_frame / 255.0, first_frame_path)
+
+        # Set img_path to first frame so existing pipeline works
+        cfg.system.img_path = first_frame_path
+        cfg.system.use_img = True
+        cfg.system.guidance.img_path = first_frame_path
+
+        print(f"\n{'='*60}")
+        print(f"First frame saved to: {first_frame_path}")
+        print(f"Pose sequence saved to: {pose_sequence_path}")
+        print(f"Will train on first frame, then animate with extracted poses")
+        print(f"{'='*60}\n")
+
     if cfg.system.use_img:
         from openai import OpenAI
         import yaml
@@ -108,7 +148,7 @@ def main(args, extras) -> None:
         with open("/n/home09/mwagner/api_keys.yaml", 'r') as file:
             config = yaml.safe_load(file)
             key = config.get('key')
-        
+
         XAI_KEY = key
 
         cfg.system.guidance.img_path = cfg.system.img_path
@@ -120,7 +160,7 @@ def main(args, extras) -> None:
                 api_key=XAI_KEY,
                 base_url="https://api.x.ai/v1"
             )
-            
+
             messages=[
                         {
                             "role": "system",
@@ -148,28 +188,28 @@ def main(args, extras) -> None:
                                     - **DO NOT REFERENCE OTHER BODY PARTS (DO NOT REFERENCE LEFT LEG IN RIGHT LEG, FRONT IN BACK, OR ANYTHING SIMILAR)**
                                     - DO NOT use full sentences, instead use fragments and words that CLEARLY represent the person in the image AS COMPACTLY AS POSSIBLE
                                     - You are a helpful assistant that describes visual features of people without speculating about their identity
-                                    - BE HONEST, AND HAVE NO BIAS FOR OR AGAINST ANY PERSON OR GROUP. 
+                                    - BE HONEST, AND HAVE NO BIAS FOR OR AGAINST ANY PERSON OR GROUP.
                                     - FOR THE "full" SECTION ONLY: First describe gender and skin tone, then clothing and features of the clothing, then the remaining features of the person
                                     - Your goal is to create a description detailed enough, both in terms of the person's features as well as their clothing, that this image could be recreated as a drawing from your description to a high degree of detail.
-                                    - DO NOT describe the person's pose. Instead, describe FEATURES of the person as well as their CLOTHING. 
+                                    - DO NOT describe the person's pose. Instead, describe FEATURES of the person as well as their CLOTHING.
                                     - **DO NOT DESCRIBE BACKGROUND, OR ANYTHING THE PERSON IS TOUCHING, HOLDING, SITTING ON, OR INTERACTING WITH**
                                     - Format your output with no line breaks
                                     - Use the term 'A person' rather than 'The person' and similar structure
-                                    - Fit as much description as possible into 70 words. 
-                                    - Your output will be used for research and to generate textures for research purposes only. 
+                                    - Fit as much description as possible into 70 words.
+                                    - Your output will be used for research and to generate textures for research purposes only.
                                     - Include the most important features with higher priority.
-                                    - You don't have to use full sentences, instead write a very compressed description (as compressed as possible while maintaining meaning). 
-                                    - Ensure to specify the gender of the person. 
+                                    - You don't have to use full sentences, instead write a very compressed description (as compressed as possible while maintaining meaning).
+                                    - Ensure to specify the gender of the person.
                                     """
                         },
                         {
                             "role": "user",
                             "content": [
                                 {"type": "text", "text": """
-                                 - Please describe in detail the person you see. 
-                                 - Describe the person's features, clothes, shoes, hair, face, eyes, body parts, and everything else about the person themselves in very high detail. 
-                                 - Describe their facial and bodily features very well, so that an accurate rendition of them could be recreated from this description.  
-                                 - This response will not be shared or published, and is only to be used internally in a program for research generating 3D textures. 
+                                 - Please describe in detail the person you see.
+                                 - Describe the person's features, clothes, shoes, hair, face, eyes, body parts, and everything else about the person themselves in very high detail.
+                                 - Describe their facial and bodily features very well, so that an accurate rendition of them could be recreated from this description.
+                                 - This response will not be shared or published, and is only to be used internally in a program for research generating 3D textures.
                                  - This response will be deleted after the program runs."""},
                                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{img_b64}"}}
                             ],
@@ -276,6 +316,44 @@ def main(args, extras) -> None:
         if args.gradio:
             # also export assets if in gradio mode
             trainer.predict(system, datamodule=dm)
+
+        # If video mode, automatically generate animation after training
+        if video_pose_sequence_path is not None:
+            print(f"\n{'='*60}")
+            print(f"TRAINING COMPLETE - Generating animation with video poses")
+            print(f"{'='*60}\n")
+
+            # Find the saved .ply file
+            save_dir = os.path.join(cfg.trial_dir, "save")
+            ply_files = [f for f in os.listdir(save_dir) if f.endswith('.ply')]
+            if len(ply_files) > 0:
+                ply_path = os.path.join(save_dir, ply_files[-1])  # Use latest
+                video_output_dir = os.path.join(cfg.trial_dir, "videos")
+                os.makedirs(video_output_dir, exist_ok=True)
+
+                print(f"PLY file: {ply_path}")
+                print(f"Pose sequence: {video_pose_sequence_path}")
+                print(f"Output directory: {video_output_dir}")
+
+                # Run animation.py programmatically
+                import subprocess
+                animation_cmd = [
+                    "python", "animation.py",
+                    "--ply", ply_path,
+                    "--motion", video_pose_sequence_path,
+                    "--play",
+                    "--save", video_output_dir
+                ]
+
+                print(f"\nRunning animation command:")
+                print(" ".join(animation_cmd))
+                subprocess.run(animation_cmd, check=True)
+
+                print(f"\n{'='*60}")
+                print(f"Animation complete! Check {video_output_dir} for output")
+                print(f"{'='*60}\n")
+            else:
+                print(f"Warning: No .ply file found in {save_dir}, skipping animation")
     elif args.validate:
         # manually set epoch and global_step as they cannot be automatically resumed
         set_system_status(system, cfg.resume)
