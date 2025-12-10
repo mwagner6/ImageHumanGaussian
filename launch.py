@@ -101,10 +101,10 @@ def main(args, extras) -> None:
 
     # Handle video input for SMPL extraction
     video_pose_sequence_path = None
-    if hasattr(cfg.system, 'use_video') and cfg.system.use_video:
+    if hasattr(cfg, 'use_video') and cfg.use_video:
         from threestudio.utils.video_smpl_extractor import extract_smpl_from_video
 
-        video_path = cfg.system.video_path
+        video_path = cfg.video_path
         print(f"\n{'='*60}")
         print(f"VIDEO MODE: Processing video for SMPL pose extraction")
         print(f"Video path: {video_path}")
@@ -121,7 +121,6 @@ def main(args, extras) -> None:
 
         # Store paths for later use
         video_pose_sequence_path = pose_sequence_path
-        cfg.system.video_pose_sequence_path = pose_sequence_path
 
         # Save first frame as image for the existing pipeline
         first_frame_path = os.path.join(output_dir, "first_frame.jpg")
