@@ -125,12 +125,16 @@ class VideoSMPLExtractor:
                 # Run NLF detection
                 pred = self.model.detect_smpl_batched(frame_batch, model_name='smplx')
 
-                # Store results
-                all_results['pose'].append(pred['pose'].cpu())
-                all_results['betas'].append(pred['betas'].cpu())
-                all_results['trans'].append(pred['trans'].cpu())
-                if 'vertices3d' in pred:
-                    all_results['vertices3d'].append(pred['vertices3d'].cpu())
+                # Handle both list and tensor outputs
+                # NLF returns lists when processing batches
+                for key in ['pose', 'betas', 'trans', 'vertices3d']:
+                    if key in pred:
+                        value = pred[key]
+                        # Convert list to tensor if needed
+                        if isinstance(value, list):
+                            value = torch.stack([torch.tensor(v) if not isinstance(v, torch.Tensor) else v for v in value])
+                        # Move to CPU
+                        all_results[key].append(value.cpu())
 
         # Concatenate all batches
         for key in all_results:
@@ -160,14 +164,21 @@ class VideoSMPLExtractor:
             pred = self.model.detect_smpl_batched(frame_batch, model_name='smplx')
 
         # Extract single frame results
-        result = {
-            'pose': pred['pose'][0],
-            'betas': pred['betas'][0],
-            'trans': pred['trans'][0]
-        }
-
-        if 'vertices3d' in pred:
-            result['vertices3d'] = pred['vertices3d'][0]
+        # Handle both list and tensor outputs from NLF
+        result = {}
+        for key in ['pose', 'betas', 'trans', 'vertices3d']:
+            if key in pred:
+                value = pred[key]
+                # If it's a list, get first element
+                if isinstance(value, list):
+                    value = value[0]
+                    # Convert to tensor if needed
+                    if not isinstance(value, torch.Tensor):
+                        value = torch.tensor(value)
+                else:
+                    # If it's a tensor, index it
+                    value = value[0]
+                result[key] = value
 
         return result
 
