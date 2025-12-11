@@ -197,35 +197,51 @@ class VideoSMPLExtractor:
 
     def save_initial_pose(self,
                          first_frame_smpl: Dict[str, torch.Tensor],
-                         output_path: str):
+                         output_path: str,
+                         use_default_apose: bool = True):
         """
-        Save initial pose from first frame for animation.py binding.
+        Save initial pose for training.
 
         Args:
-            first_frame_smpl: Dictionary with first frame SMPL-X parameters
+            first_frame_smpl: Dictionary with first frame SMPL-X parameters (for betas/trans)
             output_path: Path to save the .npz file
+            use_default_apose: If True, use default A-pose instead of actual pose (for testing)
         """
-        pose = first_frame_smpl['pose']  # Should be (165,)
+        if use_default_apose:
+            print("[INFO] Using default A-pose for training (testing mode)")
+            # Default A-pose from animation.py lines 173-180
+            body_pose = np.zeros((21, 3), dtype=np.float32)
+            body_pose[15, 2] = -0.7853982  # left_shoulder
+            body_pose[16, 2] = 0.7853982   # right_shoulder
+            body_pose[0, 1] = 0.2          # left_hip
+            body_pose[0, 2] = 0.1
+            body_pose[1, 1] = -0.2         # right_hip
+            body_pose[1, 2] = -0.1
 
-        # Ensure pose is 1D with 165 elements
-        if pose.dim() != 1 or pose.shape[0] != 165:
-            raise ValueError(f"Expected pose shape (165,), got {pose.shape}")
+            left_hand_pose = np.zeros((15, 3), dtype=np.float32)
+            right_hand_pose = np.zeros((15, 3), dtype=np.float32)
+        else:
+            pose = first_frame_smpl['pose']  # Should be (165,)
 
-        # Extract body pose (21 joints)
-        body_pose_flat = pose[3:3+21*3]  # (63,)
-        body_pose = body_pose_flat.reshape(21, 3)  # (21, 3)
+            # Ensure pose is 1D with 165 elements
+            if pose.dim() != 1 or pose.shape[0] != 165:
+                raise ValueError(f"Expected pose shape (165,), got {pose.shape}")
 
-        # Extract hand poses
-        left_hand_pose_flat = pose[25*3:40*3]  # (45,)
-        left_hand_pose = left_hand_pose_flat.reshape(15, 3)  # (15, 3)
+            # Extract body pose (21 joints)
+            body_pose_flat = pose[3:3+21*3]  # (63,)
+            body_pose = body_pose_flat.reshape(21, 3).cpu().numpy()  # (21, 3)
 
-        right_hand_pose_flat = pose[40*3:55*3]  # (45,)
-        right_hand_pose = right_hand_pose_flat.reshape(15, 3)  # (15, 3)
+            # Extract hand poses
+            left_hand_pose_flat = pose[25*3:40*3]  # (45,)
+            left_hand_pose = left_hand_pose_flat.reshape(15, 3).cpu().numpy()  # (15, 3)
+
+            right_hand_pose_flat = pose[40*3:55*3]  # (45,)
+            right_hand_pose = right_hand_pose_flat.reshape(15, 3).cpu().numpy()  # (15, 3)
 
         save_dict = {
-            'body_pose': body_pose.cpu().numpy(),
-            'left_hand_pose': left_hand_pose.cpu().numpy(),
-            'right_hand_pose': right_hand_pose.cpu().numpy(),
+            'body_pose': body_pose,
+            'left_hand_pose': left_hand_pose,
+            'right_hand_pose': right_hand_pose,
             'betas': first_frame_smpl['betas'].cpu().numpy(),
             'trans': first_frame_smpl['trans'].cpu().numpy(),
         }

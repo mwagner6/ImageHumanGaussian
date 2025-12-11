@@ -329,37 +329,11 @@ def main(args, extras) -> None:
             save_dir = os.path.join(cfg.trial_dir, "save")
             ply_files = [f for f in os.listdir(save_dir) if f.endswith('.ply')]
             if len(ply_files) > 0:
-                ply_path_trained = os.path.join(save_dir, ply_files[-1])  # Use latest
+                ply_path = os.path.join(save_dir, ply_files[-1])  # Use latest
                 video_output_dir = os.path.join(cfg.trial_dir, "videos")
                 os.makedirs(video_output_dir, exist_ok=True)
 
-                # Repose Gaussians from training pose to A-pose
-                print(f"\n{'='*60}")
-                print(f"REPOSING GAUSSIANS TO A-POSE")
-                print(f"{'='*60}\n")
-
-                from threestudio.utils.repose_gaussians import repose_gaussian_ply
-
-                ply_path_apose = os.path.join(save_dir, "last_apose.ply")
-                gender = cfg.system.gender if hasattr(cfg.system, 'gender') else 'neutral'
-
-                try:
-                    repose_gaussian_ply(
-                        input_ply_path=ply_path_trained,
-                        output_ply_path=ply_path_apose,
-                        training_pose_path=video_initial_pose_path,
-                        smplx_path=cfg.system.smplx_path if hasattr(cfg.system, 'smplx_path') else 'smplx_models',
-                        gender=gender
-                    )
-                    # Use the A-pose version for animation
-                    ply_path = ply_path_apose
-                    print(f"\nSuccessfully reposed Gaussians to A-pose")
-                except Exception as e:
-                    print(f"\nWarning: Failed to repose Gaussians: {e}")
-                    print(f"Falling back to using original .ply file")
-                    ply_path = ply_path_trained
-
-                print(f"\n{'='*60}\n")
+                print(f"\n[INFO] Training used A-pose - no reposing needed for animation\n")
 
                 # Save animation metadata for later execution
                 animation_metadata = {
