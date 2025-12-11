@@ -329,15 +329,43 @@ def main(args, extras) -> None:
             save_dir = os.path.join(cfg.trial_dir, "save")
             ply_files = [f for f in os.listdir(save_dir) if f.endswith('.ply')]
             if len(ply_files) > 0:
-                ply_path = os.path.join(save_dir, ply_files[-1])  # Use latest
+                ply_path_trained = os.path.join(save_dir, ply_files[-1])  # Use latest
                 video_output_dir = os.path.join(cfg.trial_dir, "videos")
                 os.makedirs(video_output_dir, exist_ok=True)
+
+                # Repose Gaussians from training pose to A-pose
+                print(f"\n{'='*60}")
+                print(f"REPOSING GAUSSIANS TO A-POSE")
+                print(f"{'='*60}\n")
+
+                from threestudio.utils.repose_gaussians import repose_gaussian_ply
+
+                ply_path_apose = os.path.join(save_dir, "last_apose.ply")
+                gender = cfg.system.gender if hasattr(cfg.system, 'gender') else 'neutral'
+
+                try:
+                    repose_gaussian_ply(
+                        input_ply_path=ply_path_trained,
+                        output_ply_path=ply_path_apose,
+                        training_pose_path=video_initial_pose_path,
+                        smplx_path=cfg.system.smplx_path if hasattr(cfg.system, 'smplx_path') else 'smplx_models',
+                        gender=gender
+                    )
+                    # Use the A-pose version for animation
+                    ply_path = ply_path_apose
+                    print(f"\nSuccessfully reposed Gaussians to A-pose")
+                except Exception as e:
+                    print(f"\nWarning: Failed to repose Gaussians: {e}")
+                    print(f"Falling back to using original .ply file")
+                    ply_path = ply_path_trained
+
+                print(f"\n{'='*60}\n")
 
                 # Save animation metadata for later execution
                 animation_metadata = {
                     'ply_path': ply_path,
                     'motion_path': video_pose_sequence_path,
-                    'initial_pose_path': video_initial_pose_path,
+                    'initial_pose_path': video_initial_pose_path,  # Still save for reference
                     'output_dir': video_output_dir,
                     'smplx_path': cfg.system.smplx_path if hasattr(cfg.system, 'smplx_path') else 'smplx_models'
                 }
@@ -352,12 +380,12 @@ def main(args, extras) -> None:
                 with open(animation_script_path, 'w') as f:
                     f.write("#!/bin/bash\n")
                     f.write("# Auto-generated animation script\n")
-                    f.write("# Run this after loading GCC 9.5.0\n\n")
+                    f.write("# Run this after loading GCC 9.5.0\n")
+                    f.write("# Note: .ply file has been reposed to A-pose, no --initial_pose needed\n\n")
                     f.write(f"cd {os.getcwd()}\n\n")
                     f.write(f"python animation.py \\\n")
                     f.write(f"  --ply {ply_path} \\\n")
                     f.write(f"  --motion {video_pose_sequence_path} \\\n")
-                    f.write(f"  --initial_pose {video_initial_pose_path} \\\n")
                     f.write(f"  --smplx_path {animation_metadata['smplx_path']} \\\n")
                     f.write(f"  --play \\\n")
                     f.write(f"  --save {video_output_dir}\n")
