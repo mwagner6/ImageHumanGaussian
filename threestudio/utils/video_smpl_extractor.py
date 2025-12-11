@@ -209,14 +209,17 @@ class VideoSMPLExtractor:
         """
         if use_default_apose:
             print("[INFO] Using default A-pose for training (testing mode)")
-            # Default A-pose from animation.py lines 173-180
+            # Exact A-pose from original HumanGaussian repository
+            # See: https://github.com/alvinliu0/HumanGaussian/blob/main/threestudio/utils/poser.py
             body_pose = np.zeros((21, 3), dtype=np.float32)
-            body_pose[15, 2] = -0.7853982  # left_shoulder
-            body_pose[16, 2] = 0.7853982   # right_shoulder
-            body_pose[0, 1] = 0.2          # left_hip
-            body_pose[0, 2] = 0.1
-            body_pose[1, 1] = -0.2         # right_hip
-            body_pose[1, 2] = -0.1
+            body_pose[0, 1] = 0.2          # left_hip y-rotation
+            body_pose[0, 2] = 0.1          # left_hip z-rotation
+            body_pose[1, 1] = -0.2         # right_hip y-rotation
+            body_pose[1, 2] = -0.1         # right_hip z-rotation
+            body_pose[15, 2] = -0.7853982  # left_shoulder z-rotation
+            body_pose[16, 2] = 0.7853982   # right_shoulder z-rotation
+            body_pose[19, 0] = 1.0         # left_wrist x-rotation
+            body_pose[20, 0] = 1.0         # right_wrist x-rotation
 
             left_hand_pose = np.zeros((15, 3), dtype=np.float32)
             right_hand_pose = np.zeros((15, 3), dtype=np.float32)

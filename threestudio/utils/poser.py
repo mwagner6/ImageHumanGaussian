@@ -292,38 +292,69 @@ class Skeleton:
 
         import smplx, torch
 
-        device = torch.device('cuda')
+        # If pred is provided, use it (for video mode or image detection)
+        if pred is not None:
+            device = torch.device('cuda')
+            pose = pred['pose'][0][0:1].to(device)
+            betas = pred['betas'][0][0:1].to(device)
+            transl = pred['trans'][0][0:1].to(device)
 
-        pose = pred['pose'][0][0:1].to(device)
-        betas = pred['betas'][0][0:1].to(device)
-        transl = pred['trans'][0][0:1].to(device)
+            smplx_model = smplx.create(
+                path,
+                model_type='smplx',
+                gender=gender,
+                use_face_contour=False,
+                num_betas=betas.shape[1],
+                num_expression_coeffs=10,
+                ext='npz',
+                flat_hand_mean=True,
+                use_pca=False
+            ).to(device)
 
+            smplx_output = smplx_model(
+                global_orient=pose[:, :3],
+                body_pose=pose[:, 3:22*3],
+                betas=betas,
+                transl=transl,
+                left_hand_pose=pose[:, 25*3:40*3],
+                right_hand_pose=pose[:, 40*3:55*3],
+                jaw_pose=pose[:, 22*3:23*3],
+                leye_pose=pose[:, 23*3:24*3],
+                reye_pose=pose[:, 24*3:25*3],
+                expression=expression,
+                return_verts=True
+            )
+        else:
+            # Original HumanGaussian logic: create pose from scratch
+            smplx_model = smplx.create(
+                path,
+                model_type='smplx',
+                gender=gender,
+                use_face_contour=False,
+                num_betas=10,
+                num_expression_coeffs=10,
+                ext='npz',
+                flat_hand_mean=True,
+            )
 
-        smplx_model = smplx.create(
-            path, 
-            model_type='smplx',
-            gender=gender, 
-            use_face_contour=False,
-            num_betas=betas.shape[1],
-            num_expression_coeffs=10,
-            ext='npz',
-            flat_hand_mean=True,
-            use_pca=False
-        ).to(device)
+            # Initialize body_pose with A-pose if requested
+            body_pose = np.zeros((21, 3), dtype=np.float32)
+            if self.apose:
+                body_pose[0, 1] = 0.2
+                body_pose[0, 2] = 0.1
+                body_pose[1, 1] = -0.2
+                body_pose[1, 2] = -0.1
+                body_pose[15, 2] = -0.7853982
+                body_pose[16, 2] = 0.7853982
+                body_pose[19, 0] = 1.0
+                body_pose[20, 0] = 1.0
 
-        smplx_output = smplx_model(
-            global_orient=pose[:, :3],
-            body_pose=pose[:, 3:22*3],
-            betas=betas,
-            transl=transl,
-            left_hand_pose=pose[:, 25*3:40*3],
-            right_hand_pose=pose[:, 40*3:55*3],
-            jaw_pose=pose[:, 22*3:23*3],
-            leye_pose=pose[:, 23*3:24*3],
-            reye_pose=pose[:, 24*3:25*3],
-            expression=expression, 
-            return_verts=True
-        )
+            smplx_output = smplx_model(
+                body_pose=torch.tensor(body_pose, dtype=torch.float32).unsqueeze(0),
+                betas=betas,
+                expression=expression,
+                return_verts=True
+            )
 
         self.vertices = smplx_output.vertices.detach().cpu().numpy()[0] # [10475, 3]
         self.faces = smplx_model.faces # [20908, 3]
@@ -334,8 +365,20 @@ class Skeleton:
             joints = joint_mapper_smplx_to_humansd17(joints)
         else:
             joints = joint_mapper_smplx_to_openpose18(joints)
-            
+
         self.points3D = np.concatenate([joints, np.ones_like(joints[:, :1])], axis=1) # [18, 4]
+
+        # Original normalization logic (moved from normalize() method)
+        vmin = self.vertices.min(0)
+        vmax = self.vertices.max(0)
+        self.ori_center = (vmax + vmin) / 2
+        self.ori_scale = 0.6 / np.max(vmax - vmin)
+        self.vertices = (self.vertices - self.ori_center) * self.ori_scale
+        self.points3D[:, :3] = (self.points3D[:, :3] - self.ori_center) * self.ori_scale
+
+        # Coordinate system conversion: opengl --> blender (switch y/z)
+        self.points3D[:, [1, 2]] = self.points3D[:, [2, 1]]
+        self.vertices[:, [1, 2]] = self.vertices[:, [2, 1]]
 
     def normalize(self):
         vmin = self.vertices.min(0)
