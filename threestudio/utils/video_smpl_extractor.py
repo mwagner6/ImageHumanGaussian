@@ -169,15 +169,21 @@ class VideoSMPLExtractor:
         for key in ['pose', 'betas', 'trans', 'vertices3d']:
             if key in pred:
                 value = pred[key]
+                print(f"[DEBUG] {key} - original type: {type(value)}, original shape: {value.shape if isinstance(value, torch.Tensor) else 'N/A'}")
+
                 # If it's a list, get first element
                 if isinstance(value, list):
+                    print(f"[DEBUG] {key} - is list, length: {len(value)}")
                     value = value[0]
                     # Convert to tensor if needed
                     if not isinstance(value, torch.Tensor):
                         value = torch.tensor(value)
                 else:
                     # If it's a tensor, index it
+                    print(f"[DEBUG] {key} - is tensor, indexing with [0]")
                     value = value[0]
+
+                print(f"[DEBUG] {key} - final type: {type(value)}, final shape: {value.shape}")
                 result[key] = value
 
         return result
@@ -192,7 +198,21 @@ class VideoSMPLExtractor:
             first_frame_smpl: Dictionary with first frame SMPL-X parameters
             output_path: Path to save the .npz file
         """
-        pose = first_frame_smpl['pose']  # (165,)
+        pose = first_frame_smpl['pose']  # Should be (165,)
+
+        # Debug: print actual shape
+        print(f"[DEBUG] pose shape: {pose.shape}, pose dtype: {pose.dtype}")
+
+        # Ensure pose is 1D with 165 elements
+        if pose.dim() == 2:
+            # If it's (1, 165), squeeze to (165,)
+            pose = pose.squeeze(0)
+        elif pose.dim() == 0:
+            # If it's a scalar, this is wrong
+            raise ValueError(f"pose has 0 dimensions: {pose.shape}")
+
+        if pose.shape[0] < 165:
+            raise ValueError(f"pose has {pose.shape[0]} elements, expected 165")
 
         # Extract body pose (21 joints)
         body_pose_flat = pose[3:3+21*3]  # (63,)
