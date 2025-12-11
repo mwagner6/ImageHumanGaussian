@@ -318,10 +318,11 @@ def main(args, extras) -> None:
             # also export assets if in gradio mode
             trainer.predict(system, datamodule=dm)
 
-        # If video mode, automatically generate animation after training
+        # If video mode, save animation command for later execution
+        # (Animation requires different GCC version on SLURM clusters)
         if video_pose_sequence_path is not None:
             print(f"\n{'='*60}")
-            print(f"TRAINING COMPLETE - Generating animation with video poses")
+            print(f"TRAINING COMPLETE - Preparing animation metadata")
             print(f"{'='*60}\n")
 
             # Find the saved .ply file
@@ -332,29 +333,46 @@ def main(args, extras) -> None:
                 video_output_dir = os.path.join(cfg.trial_dir, "videos")
                 os.makedirs(video_output_dir, exist_ok=True)
 
+                # Save animation metadata for later execution
+                animation_metadata = {
+                    'ply_path': ply_path,
+                    'motion_path': video_pose_sequence_path,
+                    'initial_pose_path': video_initial_pose_path,
+                    'output_dir': video_output_dir,
+                    'smplx_path': cfg.system.smplx_path if hasattr(cfg.system, 'smplx_path') else 'smplx_models'
+                }
+
+                metadata_path = os.path.join(cfg.trial_dir, "animation_metadata.json")
+                import json
+                with open(metadata_path, 'w') as f:
+                    json.dump(animation_metadata, f, indent=2)
+
+                # Create animation command script
+                animation_script_path = os.path.join(cfg.trial_dir, "run_animation.sh")
+                with open(animation_script_path, 'w') as f:
+                    f.write("#!/bin/bash\n")
+                    f.write("# Auto-generated animation script\n")
+                    f.write("# Run this after loading GCC 9.5.0\n\n")
+                    f.write(f"cd {os.getcwd()}\n\n")
+                    f.write(f"python animation.py \\\n")
+                    f.write(f"  --ply {ply_path} \\\n")
+                    f.write(f"  --motion {video_pose_sequence_path} \\\n")
+                    f.write(f"  --initial_pose {video_initial_pose_path} \\\n")
+                    f.write(f"  --smplx_path {animation_metadata['smplx_path']} \\\n")
+                    f.write(f"  --play \\\n")
+                    f.write(f"  --save {video_output_dir}\n")
+
+                os.chmod(animation_script_path, 0o755)  # Make executable
+
                 print(f"PLY file: {ply_path}")
                 print(f"Pose sequence: {video_pose_sequence_path}")
                 print(f"Initial pose: {video_initial_pose_path}")
                 print(f"Output directory: {video_output_dir}")
-
-                # Run animation.py programmatically
-                import subprocess
-                animation_cmd = [
-                    "python", "animation.py",
-                    "--ply", ply_path,
-                    "--motion", video_pose_sequence_path,
-                    "--initial_pose", video_initial_pose_path,
-                    "--play",
-                    "--save", video_output_dir
-                ]
-
-                print(f"\nRunning animation command:")
-                print(" ".join(animation_cmd))
-                subprocess.run(animation_cmd, check=True)
-
-                print(f"\n{'='*60}")
-                print(f"Animation complete! Check {video_output_dir} for output")
-                print(f"{'='*60}\n")
+                print(f"\nAnimation metadata saved to: {metadata_path}")
+                print(f"Animation script saved to: {animation_script_path}")
+                print(f"\nTo run animation (requires GCC 9.5.0):")
+                print(f"  bash {animation_script_path}")
+                print(f"\n{'='*60}\n")
             else:
                 print(f"Warning: No .ply file found in {save_dir}, skipping animation")
     elif args.validate:
