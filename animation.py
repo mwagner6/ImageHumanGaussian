@@ -116,6 +116,9 @@ class Skeleton:
             [self.points3D, np.ones_like(self.points3D[:, :1])], axis=1
         )  # [18, 4]
 
+        # coordinate system: opengl --> blender (switch y/z) to match training system
+        self.points3D[:, [1, 2]] = self.points3D[:, [2, 1]]
+
         # lines [17, 2]
         self.lines = np.array(
             [
