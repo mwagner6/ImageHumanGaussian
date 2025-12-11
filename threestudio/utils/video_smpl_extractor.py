@@ -228,7 +228,10 @@ class VideoSMPLExtractor:
         Save SMPL-X pose sequence in format compatible with animation.py.
 
         The animation.py script expects:
-        - 'poses': (num_frames, 21, 3) - body pose in axis-angle format
+        - 'poses': (num_frames, num_joints, 3) where it will slice [:, 1:22]
+
+        We need to save in format: (num_frames, 22, 3) with joint 0 being global orient
+        so that animation.py can do [:, 1:22] to get the 21 body joints.
 
         Args:
             smpl_data: Dictionary with SMPL-X parameters
@@ -237,15 +240,21 @@ class VideoSMPLExtractor:
         """
         pose = smpl_data['pose']  # (num_frames, 165)
 
-        # Extract body pose (21 joints)
         # SMPL-X pose format: [global_orient(3), body_pose(63), ...]
-        # We need joints 1-22 (body_pose starts at index 3, 21*3=63 params)
+        # Extract: global_orient (joint 0) + body_pose (joints 1-21)
+        global_orient = pose[:, 0:3]  # (num_frames, 3)
         body_pose_flat = pose[:, 3:3+21*3]  # (num_frames, 63)
+
+        # Reshape to (num_frames, 22, 3) - [global_orient, joint1, joint2, ..., joint21]
+        global_orient = global_orient.reshape(-1, 1, 3)  # (num_frames, 1, 3)
         body_pose = body_pose_flat.reshape(-1, 21, 3)  # (num_frames, 21, 3)
+
+        # Concatenate: (num_frames, 22, 3)
+        poses_with_global = torch.cat([global_orient, body_pose], dim=1)
 
         # Optionally save other parameters
         save_dict = {
-            'poses': body_pose.cpu().numpy(),
+            'poses': poses_with_global.cpu().numpy(),  # (num_frames, 22, 3)
             'fps': fps,
             'num_frames': pose.shape[0],
             # Full SMPL-X parameters for potential future use
@@ -258,7 +267,8 @@ class VideoSMPLExtractor:
         np.savez(output_path, **save_dict)
         print(f"Saved pose sequence to: {output_path}")
         print(f"  - Number of frames: {pose.shape[0]}")
-        print(f"  - Body pose shape: {body_pose.shape}")
+        print(f"  - Poses shape (with global orient): {poses_with_global.shape}")
+        print(f"  - After [:, 1:22] slice will be: ({poses_with_global.shape[0]}, 21, 3)")
         print(f"  - FPS: {fps}")
 
     def process_video(self,
