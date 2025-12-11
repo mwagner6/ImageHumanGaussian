@@ -182,6 +182,44 @@ class VideoSMPLExtractor:
 
         return result
 
+    def save_initial_pose(self,
+                         first_frame_smpl: Dict[str, torch.Tensor],
+                         output_path: str):
+        """
+        Save initial pose from first frame for animation.py binding.
+
+        Args:
+            first_frame_smpl: Dictionary with first frame SMPL-X parameters
+            output_path: Path to save the .npz file
+        """
+        pose = first_frame_smpl['pose']  # (165,)
+
+        # Extract body pose (21 joints)
+        body_pose_flat = pose[3:3+21*3]  # (63,)
+        body_pose = body_pose_flat.reshape(21, 3)  # (21, 3)
+
+        # Extract hand poses
+        left_hand_pose_flat = pose[25*3:40*3]  # (45,)
+        left_hand_pose = left_hand_pose_flat.reshape(15, 3)  # (15, 3)
+
+        right_hand_pose_flat = pose[40*3:55*3]  # (45,)
+        right_hand_pose = right_hand_pose_flat.reshape(15, 3)  # (15, 3)
+
+        save_dict = {
+            'body_pose': body_pose.cpu().numpy(),
+            'left_hand_pose': left_hand_pose.cpu().numpy(),
+            'right_hand_pose': right_hand_pose.cpu().numpy(),
+            'betas': first_frame_smpl['betas'].cpu().numpy(),
+            'trans': first_frame_smpl['trans'].cpu().numpy(),
+        }
+
+        os.makedirs(os.path.dirname(output_path) if os.path.dirname(output_path) else '.', exist_ok=True)
+        np.savez(output_path, **save_dict)
+        print(f"Saved initial pose to: {output_path}")
+        print(f"  - Body pose shape: {body_pose.shape}")
+        print(f"  - Left hand pose shape: {left_hand_pose.shape}")
+        print(f"  - Right hand pose shape: {right_hand_pose.shape}")
+
     def save_pose_sequence(self,
                           smpl_data: Dict[str, torch.Tensor],
                           output_path: str,
@@ -226,7 +264,7 @@ class VideoSMPLExtractor:
     def process_video(self,
                      video_path: str,
                      output_dir: str,
-                     batch_size: int = 4) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], str]:
+                     batch_size: int = 4) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], str, str]:
         """
         Complete pipeline: extract frames, process all poses, save sequence.
 
@@ -239,6 +277,7 @@ class VideoSMPLExtractor:
             first_frame: First frame tensor for initialization
             first_frame_smpl: SMPL-X data for first frame
             pose_sequence_path: Path to saved pose sequence .npz file
+            initial_pose_path: Path to saved initial pose .npz file
         """
         # Extract frames
         frames, fps, num_frames = self.extract_frames_from_video(video_path)
@@ -248,21 +287,27 @@ class VideoSMPLExtractor:
         first_frame_smpl = self.get_first_frame_data(frames)
         first_frame = TFunc.rotate(TFunc.hflip(frames[0]), angle=180)
 
+        # Get video name for file paths
+        video_name = os.path.splitext(os.path.basename(video_path))[0]
+
+        # Save initial pose for animation binding
+        initial_pose_path = os.path.join(output_dir, f"{video_name}_initial_pose.npz")
+        self.save_initial_pose(first_frame_smpl, initial_pose_path)
+
         # Process all frames
         print("\nProcessing all frames for pose sequence...")
         all_smpl_data = self.process_frame_batch(frames, batch_size=batch_size)
 
         # Save pose sequence
-        video_name = os.path.splitext(os.path.basename(video_path))[0]
         pose_sequence_path = os.path.join(output_dir, f"{video_name}_poses.npz")
         self.save_pose_sequence(all_smpl_data, pose_sequence_path, fps=fps)
 
-        return first_frame, first_frame_smpl, pose_sequence_path
+        return first_frame, first_frame_smpl, pose_sequence_path, initial_pose_path
 
 
 def extract_smpl_from_video(video_path: str,
                             output_dir: str,
-                            batch_size: int = 4) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], str]:
+                            batch_size: int = 4) -> Tuple[torch.Tensor, Dict[str, torch.Tensor], str, str]:
     """
     Convenience function to extract SMPL poses from video.
 
@@ -275,6 +320,7 @@ def extract_smpl_from_video(video_path: str,
         first_frame: First frame tensor for training
         first_frame_smpl: SMPL-X parameters for first frame
         pose_sequence_path: Path to saved pose sequence
+        initial_pose_path: Path to saved initial pose
     """
     extractor = VideoSMPLExtractor()
     return extractor.process_video(video_path, output_dir, batch_size)

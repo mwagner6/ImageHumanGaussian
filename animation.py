@@ -944,6 +944,10 @@ if __name__ == "__main__":
     parser.add_argument("--ply", type=str, help="path to gaussians ply")
     parser.add_argument("--motion", type=str, help="path to mition file")
     parser.add_argument(
+        "--initial_pose", type=str, default=None,
+        help="path to initial pose file (for video mode binding)"
+    )
+    parser.add_argument(
         "--smplx_path",
         type=str,
         default="smplx_models",
@@ -978,6 +982,16 @@ if __name__ == "__main__":
     )
 
     gui = GUI(opt)
+
+    # Load initial pose if provided (for video mode)
+    if opt.initial_pose is not None:
+        print(f"[INFO] loading initial pose from {opt.initial_pose}")
+        initial_data = np.load(opt.initial_pose)
+        gui.skel.body_pose = initial_data['body_pose']
+        gui.skel.left_hand_pose = initial_data['left_hand_pose']
+        gui.skel.right_hand_pose = initial_data['right_hand_pose']
+        print(f"[INFO] loaded initial pose: body_pose {gui.skel.body_pose.shape}, "
+              f"left_hand {gui.skel.left_hand_pose.shape}, right_hand {gui.skel.right_hand_pose.shape}")
 
     print(f"[INFO] load smplx from {opt.smplx_path}")
     gui.skel.load_smplx(opt.smplx_path)

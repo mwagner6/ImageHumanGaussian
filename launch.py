@@ -101,6 +101,7 @@ def main(args, extras) -> None:
 
     # Handle video input for SMPL extraction
     video_pose_sequence_path = None
+    video_initial_pose_path = None
     if hasattr(cfg, 'use_video') and cfg.use_video:
         from threestudio.utils.video_smpl_extractor import extract_smpl_from_video
 
@@ -113,7 +114,7 @@ def main(args, extras) -> None:
         # Extract SMPL poses from all frames
         # This will save a .npz file with pose sequences
         output_dir = cfg.trial_dir
-        first_frame, first_frame_smpl, pose_sequence_path = extract_smpl_from_video(
+        first_frame, first_frame_smpl, pose_sequence_path, initial_pose_path = extract_smpl_from_video(
             video_path,
             output_dir,
             batch_size=4
@@ -121,6 +122,7 @@ def main(args, extras) -> None:
 
         # Store paths for later use
         video_pose_sequence_path = pose_sequence_path
+        video_initial_pose_path = initial_pose_path
 
         # Save first frame as image for the existing pipeline
         first_frame_path = os.path.join(output_dir, "first_frame.jpg")
@@ -332,6 +334,7 @@ def main(args, extras) -> None:
 
                 print(f"PLY file: {ply_path}")
                 print(f"Pose sequence: {video_pose_sequence_path}")
+                print(f"Initial pose: {video_initial_pose_path}")
                 print(f"Output directory: {video_output_dir}")
 
                 # Run animation.py programmatically
@@ -340,6 +343,7 @@ def main(args, extras) -> None:
                     "python", "animation.py",
                     "--ply", ply_path,
                     "--motion", video_pose_sequence_path,
+                    "--initial_pose", video_initial_pose_path,
                     "--play",
                     "--save", video_output_dir
                 ]
